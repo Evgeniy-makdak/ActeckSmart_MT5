@@ -5,18 +5,22 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.1"
-#property description "ActeckSmart v1.1 — КЗ, зигзаг M15, продолженное движение"
+#property version   "1.2"
+#property description "ActeckSmart v1.2 — КЗ, ПД (стиль Sniper), RSI HUD"
 #property indicator_chart_window
 #property indicator_buffers 1
 #property indicator_plots   1
 #property indicator_type1   DRAW_NONE
 #property indicator_label1  "ActeckSmart"
 
-// Версия индикатора: повышать при каждом коммите (сейчас 1.1 — минор)
-#define AS_VERSION   "1.1"
+// Версия индикатора: повышать при каждом коммите (сейчас 1.2 — минор)
+#define AS_VERSION   "1.2"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
-#define AS_TITLE_OBJ "TITLE"   // суффикс к InpPrefix — подпись в правом углу
+#define AS_TITLE_OBJ "TITLE"   // суффикс к InpPrefix — подпись названия
+#define AS_RSI_CANVAS "RSI_CV" // bitmap sparkline RSI
+#define AS_RSI_LABEL  "RSI_LB" // число RSI
+
+#include <Canvas/Canvas.mqh>
 
 //+------------------------------------------------------------------+
 //| Входные параметры                                                |
@@ -78,8 +82,10 @@ input ENUM_LINE_STYLE InpContStyle   = STYLE_DASH; // Стиль линий ПД
 input int    InpContWidth            = 1;         // Толщина линий ПД
 input int    InpContFontSize         = 10;        // Размер шрифта курсора/подписи ПД
 input bool   InpShowContCursor       = true;      // Показывать курсор на конце ПД
-input bool   InpHideObsoleteCM       = true;      // Скрывать линии старого ПД при появлении нового
-input int    InpMaxVisibleCM         = 2;         // Макс. видимых структур ПД (0 = все)
+input bool   InpSniperStyleHistory   = true;      // Стиль Sniper: хранить старые ПД/зоны (false = откат к v1.1)
+input bool   InpHideObsoleteCM       = true;      // [v1.1] Скрывать линии старого ПД (если SniperStyle=false)
+input bool   InpKeepObsoleteZones    = true;      // [Sniper] Оставлять зоны Fib у старых ПД
+input int    InpMaxVisibleCM         = 2;         // [v1.1] Макс. видимых ПД (0=все; при SniperStyle игнор.)
 input bool   InpContAlert            = false;     // Алерт появления ПД
 
 input string InpSep7                 = "======== ЗОНЫ ИНТЕРЕСОВ (Fib 38.2%) ========"; // —
@@ -88,6 +94,18 @@ input color  InpBuyZoneColor         = C'173,216,230'; // Зона покупа�
 input color  InpSellZoneColor        = C'255,182,193'; // Зона продавцов (нежно-розовый)
 input int    InpZoneAlpha            = 60;        // Прозрачность заливки зоны (0-255)
 input double InpFibLevel             = 0.382;     // Уровень Фибоначчи зоны интересов
+
+input string InpSepRSI               = "======== RSI HUD (как Sniper) ========"; // —
+input bool   InpShowRSI              = true;      // Показывать RSI в правом верхнем углу
+input int    InpRSIPeriod            = 14;        // Период RSI
+input bool   InpRSIUseM15            = false;     // RSI на M15 (false = ТФ графика)
+input int    InpRSISparkBars         = 40;        // Баров в мини-графике RSI
+input int    InpRSISparkWidth        = 56;        // Ширина мини-графика (px)
+input int    InpRSISparkHeight       = 22;        // Высота мини-графика (px)
+input int    InpRSIFontSize          = 14;        // Размер шрифта числа RSI
+input color  InpRSIColorMid          = C'34,139,34';   // Зелёный (35..65)
+input color  InpRSIColorWarn         = C'204,153,0';   // Жёлтый читаемый на белом (30-35, 65-70)
+input color  InpRSIColorExt          = clrCrimson;     // Красный (<30, >70)
 
 input string InpSep8                 = "======== ПРЕФИКС ОБЪЕКТОВ ========"; // —
 input string InpPrefix               = "AS_";     // Префикс графических объектов
@@ -302,7 +320,21 @@ public:
 
    void DeleteAll(void)
      {
-      ObjectsDeleteAll(m_chart, m_prefix);
+      // Не трогаем HUD (название, RSI) — иначе мигает каждый пересчёт
+      int total = ObjectsTotal(m_chart, 0, -1);
+      for(int i = total - 1; i >= 0; i--)
+        {
+         string nm = ObjectName(m_chart, i, 0, -1);
+         if(StringFind(nm, m_prefix) != 0)
+            continue;
+         if(StringFind(nm, AS_TITLE_OBJ) >= 0)
+            continue;
+         if(StringFind(nm, AS_RSI_CANVAS) >= 0)
+            continue;
+         if(StringFind(nm, AS_RSI_LABEL) >= 0)
+            continue;
+         ObjectDelete(m_chart, nm);
+        }
      }
 
    bool Trend(const string name, datetime t1, double p1, datetime t2, double p2,
@@ -1094,9 +1126,10 @@ public:
          return;
 
       int n = ArraySize(m_items);
-      // Сколько последних структур показывать линиями
+      // Режим Sniper: не выкидываем историю. Режим v1.1: скрываем obsolete / лимит.
+      const bool sniper_hist = InpSniperStyleHistory;
       int first_lines = 0;
-      if(InpMaxVisibleCM > 0)
+      if(!sniper_hist && InpMaxVisibleCM > 0)
          first_lines = MathMax(0, n - InpMaxVisibleCM);
 
       for(int i = 0; i < n; i++)
@@ -1105,7 +1138,14 @@ public:
          if(ShouldDeleteByAge(c.time_start, now_broker))
             continue;
 
-         const bool hide_lines = (InpHideObsoleteCM && c.obsolete) || (i < first_lines);
+         // Sniper: линии старого ПД прячем, но зону Fib и курсор оставляем (франк).
+         // v1.1: InpHideObsoleteCM + лимит MaxVisibleCM.
+         const bool hide_lines = sniper_hist
+                                ? c.obsolete
+                                : ((InpHideObsoleteCM && c.obsolete) || (i < first_lines));
+         const bool show_zone = InpShowInterestZones &&
+                                (sniper_hist ? (InpKeepObsoleteZones || !c.obsolete)
+                                             : !c.obsolete);
          color base = (c.direction == DIR_UP) ? InpContUpColor : InpContDownColor;
          color clr  = ApplyFade(base, c.time_start, now_broker);
 
@@ -1138,18 +1178,37 @@ public:
                                 clr, InpContWidth, InpContStyle);
               }
 
-            // Зона интересов Fib 38.2% — только у актуального (не obsolete) ПД
-            if(InpShowInterestZones && !c.obsolete)
+            // Зона интересов Fib 38.2% (в стиле Sniper — и у прежних ПД)
+            if(show_zone)
               {
                double span = c.price_break - c.unbroken_kz;
                double fib  = c.unbroken_kz + span * InpFibLevel;
                color zclr = (c.direction == DIR_UP) ? InpBuyZoneColor : InpSellZoneColor;
                zclr = ApplyFade(zclr, c.time_start, now_broker);
+               int za = InpZoneAlpha;
+               if(c.obsolete && sniper_hist)
+                  za = MathMax(25, InpZoneAlpha * 2 / 3);
+               // Как в Sniper: зона тянется вправо к текущему времени
+               datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
+               if(zt2 < t_h_end)
+                  zt2 = t_h_end;
                gfx.Rectangle("CM_Z_" + IntegerToString(i),
                              c.time_start, c.unbroken_kz,
-                             t_h_end, fib,
-                             zclr, InpZoneAlpha);
+                             zt2, fib,
+                             zclr, za);
               }
+           }
+         else if(show_zone)
+           {
+            double span = c.price_break - c.unbroken_kz;
+            double fib  = c.unbroken_kz + span * InpFibLevel;
+            color zclr = (c.direction == DIR_UP) ? InpBuyZoneColor : InpSellZoneColor;
+            zclr = ApplyFade(zclr, c.time_start, now_broker);
+            datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
+            gfx.Rectangle("CM_Z_" + IntegerToString(i),
+                          c.time_start, c.unbroken_kz,
+                          zt2, fib,
+                          zclr, InpZoneAlpha);
            }
 
          // Курсор: синий вверх / красный вниз + размер в пунктах (как «160.64» в образце)
@@ -1178,9 +1237,24 @@ CContinuedMove    g_cont;
 datetime          g_last_m15_bar = 0;
 MqlRates          g_rates[];
 double            g_dummy_buf[];   // служебный буфер — чтобы MT5 показал имя индикатора
+int               g_rsi_handle = INVALID_HANDLE;
+CCanvas           g_rsi_canvas;
+bool              g_rsi_canvas_ok = false;
 
 //+------------------------------------------------------------------+
-//| Подпись названия+версии в правом верхнем углу графика            |
+//| Цвет RSI по порогам Sniper                                       |
+//+------------------------------------------------------------------+
+color RSIValueColor(const double rsi)
+  {
+   if(rsi < 30.0 || rsi > 70.0)
+      return InpRSIColorExt;
+   if((rsi >= 30.0 && rsi <= 35.0) || (rsi >= 65.0 && rsi <= 70.0))
+      return InpRSIColorWarn;
+   return InpRSIColorMid;
+  }
+
+//+------------------------------------------------------------------+
+//| Подпись названия+версии в правом верхнем углу                    |
 //+------------------------------------------------------------------+
 void UpdateTitleLabel(void)
   {
@@ -1192,8 +1266,8 @@ void UpdateTitleLabel(void)
      }
    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
    ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
-   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 18);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 8);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 14);
    ObjectSetString(0, name, OBJPROP_TEXT, AS_SHORTNAME);
    ObjectSetString(0, name, OBJPROP_FONT, "Arial");
    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
@@ -1201,6 +1275,143 @@ void UpdateTitleLabel(void)
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, name, OBJPROP_BACK, false);
+  }
+
+//+------------------------------------------------------------------+
+//| Инициализация / уничтожение RSI HUD                              |
+//+------------------------------------------------------------------+
+bool InitRSIHud(void)
+  {
+   if(!InpShowRSI)
+      return true;
+
+   ENUM_TIMEFRAMES tf = InpRSIUseM15 ? WORK_TF : (ENUM_TIMEFRAMES)_Period;
+   g_rsi_handle = iRSI(_Symbol, tf, InpRSIPeriod, PRICE_CLOSE);
+   if(g_rsi_handle == INVALID_HANDLE)
+     {
+      Print("ActeckSmart: не удалось создать RSI handle, err=", GetLastError());
+      return false;
+     }
+
+   string cname = InpPrefix + AS_RSI_CANVAS;
+   if(!g_rsi_canvas.CreateBitmapLabel(cname, 0, 0, InpRSISparkWidth, InpRSISparkHeight,
+                                      COLOR_FORMAT_ARGB_NORMALIZE))
+     {
+      Print("ActeckSmart: Canvas RSI не создан, err=", GetLastError());
+      return false;
+     }
+   ObjectSetInteger(0, cname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, cname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+   ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 8 + 40);
+   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 36);
+   ObjectSetInteger(0, cname, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, cname, OBJPROP_HIDDEN, true);
+   g_rsi_canvas_ok = true;
+   return true;
+  }
+
+void DeinitRSIHud(void)
+  {
+   if(g_rsi_handle != INVALID_HANDLE)
+     {
+      IndicatorRelease(g_rsi_handle);
+      g_rsi_handle = INVALID_HANDLE;
+     }
+   if(g_rsi_canvas_ok)
+     {
+      g_rsi_canvas.Destroy();
+      g_rsi_canvas_ok = false;
+     }
+   ObjectDelete(0, InpPrefix + AS_RSI_LABEL);
+   ObjectDelete(0, InpPrefix + AS_RSI_CANVAS);
+  }
+
+//+------------------------------------------------------------------+
+//| Обновление RSI: мини-график слева + число справа (как Sniper)    |
+//+------------------------------------------------------------------+
+void UpdateRSIHud(void)
+  {
+   if(!InpShowRSI || g_rsi_handle == INVALID_HANDLE)
+      return;
+
+   int need = MathMax(InpRSISparkBars + 5, InpRSIPeriod + 5);
+   double rsi[];
+   ArraySetAsSeries(rsi, true);
+   if(CopyBuffer(g_rsi_handle, 0, 0, need, rsi) < InpRSISparkBars)
+      return;
+
+   double cur = rsi[0];
+   color  clr = RSIValueColor(cur);
+
+   // --- число RSI ---
+   string lname = InpPrefix + AS_RSI_LABEL;
+   if(ObjectFind(0, lname) < 0)
+     {
+      if(!ObjectCreate(0, lname, OBJ_LABEL, 0, 0, 0))
+         return;
+     }
+   ObjectSetInteger(0, lname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, lname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+   ObjectSetInteger(0, lname, OBJPROP_XDISTANCE, 8);
+   ObjectSetInteger(0, lname, OBJPROP_YDISTANCE, 34);
+   ObjectSetString(0, lname, OBJPROP_TEXT, IntegerToString((int)MathRound(cur)));
+   ObjectSetString(0, lname, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, lname, OBJPROP_FONTSIZE, InpRSIFontSize);
+   ObjectSetInteger(0, lname, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, lname, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, lname, OBJPROP_HIDDEN, true);
+
+   // --- sparkline слева от числа ---
+   if(!g_rsi_canvas_ok)
+      return;
+
+   string cname = InpPrefix + AS_RSI_CANVAS;
+   ObjectSetInteger(0, cname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, cname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+   ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 8 + 36);
+   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 36);
+
+   const int w = InpRSISparkWidth;
+   const int h = InpRSISparkHeight;
+   g_rsi_canvas.Erase(ColorToARGB(clrWhite, 0)); // прозрачный фон
+
+   // рамка/подложка едва заметная
+   g_rsi_canvas.FillRectangle(0, 0, w - 1, h - 1, ColorToARGB(C'250,250,250', 180));
+
+   int bars = MathMin(InpRSISparkBars, ArraySize(rsi));
+   if(bars < 2)
+     {
+      g_rsi_canvas.Update();
+      return;
+     }
+
+   double rmin = rsi[0], rmax = rsi[0];
+   for(int i = 1; i < bars; i++)
+     {
+      if(rsi[i] < rmin) rmin = rsi[i];
+      if(rsi[i] > rmax) rmax = rsi[i];
+     }
+   if(rmax - rmin < 1.0)
+     {
+      rmin -= 1.0;
+      rmax += 1.0;
+     }
+
+   uint line_clr = ColorToARGB(clr, 255);
+   int prev_x = 0, prev_y = 0;
+   for(int i = 0; i < bars; i++)
+     {
+      // rsi[bars-1] слева → rsi[0] справа
+      int idx = bars - 1 - i;
+      int x = (int)MathRound((double)i * (w - 1) / (bars - 1));
+      double nrm = (rsi[idx] - rmin) / (rmax - rmin);
+      int y = (int)MathRound((h - 2) * (1.0 - nrm)) + 1;
+      if(i > 0)
+         g_rsi_canvas.Line(prev_x, prev_y, x, y, line_clr);
+      prev_x = x;
+      prev_y = y;
+     }
+   g_rsi_canvas.Update();
   }
 
 //+------------------------------------------------------------------+
@@ -1261,8 +1472,8 @@ void RecalculateAll(void)
    g_kz.Draw(g_gfx, g_rates, total, now_broker);
    g_cont.Draw(g_gfx, g_rates, total, now_broker);
 
-   // DeleteAll снимает и TITLE — восстанавливаем подпись с версией
    UpdateTitleLabel();
+   UpdateRSIHud();
    ChartRedraw(0);
   }
 
@@ -1299,10 +1510,13 @@ int OnInit()
    g_kz.SetZigZag(GetPointer(g_zz1));
    g_cont.SetKZ(GetPointer(g_kz));
 
+   if(!InitRSIHud())
+      Print("ActeckSmart: RSI HUD отключён из-за ошибки инициализации");
+
    g_last_m15_bar = 0;
    RecalculateAll();
    UpdateTitleLabel();
-   // Сбрасываем флаг, чтобы первый тик после init не пропускал логику зря
+   UpdateRSIHud();
    g_last_m15_bar = iTime(_Symbol, WORK_TF, 0);
    return INIT_SUCCEEDED;
   }
@@ -1310,6 +1524,7 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    g_gfx.DeleteAll();
+   DeinitRSIHud();
    ObjectDelete(0, InpPrefix + AS_TITLE_OBJ);
   }
 
@@ -1324,7 +1539,10 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
   {
-   // Обновление строго по закрытию свечи M15
+   // RSI HUD — на каждом тике (как у Sniper)
+   UpdateRSIHud();
+
+   // Разметка КЗ/ПД — строго по закрытию свечи M15
    if(prev_calculated == 0)
      {
       RecalculateAll();
@@ -1332,7 +1550,6 @@ int OnCalculate(const int rates_total,
       return rates_total;
      }
 
-   // Новый бар M15 = предыдущий закрылся
    datetime t0 = iTime(_Symbol, WORK_TF, 0);
    if(t0 != 0 && t0 != g_last_m15_bar)
      {
@@ -1343,13 +1560,13 @@ int OnCalculate(const int rates_total,
   }
 
 //+------------------------------------------------------------------+
-//| Обработка событий графика (смена ТФ — перерисовка тех же объектов)|
+//| Обработка событий графика                                        |
 //+------------------------------------------------------------------+
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
   {
    if(id == CHARTEVENT_CHART_CHANGE)
      {
-      // Объекты привязаны ко времени M15 — просто перерисуем
+      UpdateRSIHud();
       ChartRedraw(0);
      }
   }
