@@ -5,20 +5,18 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.2"
-#property description "ActeckSmart v1.2 — КЗ, ПД (стиль Sniper), RSI HUD"
+#property version   "1.3"
+#property description "ActeckSmart v1.3 — зоны по ликвидности, RSI HUD"
 #property indicator_chart_window
 #property indicator_buffers 1
 #property indicator_plots   1
 #property indicator_type1   DRAW_NONE
 #property indicator_label1  "ActeckSmart"
 
-// Версия индикатора: повышать при каждом коммите (сейчас 1.2 — минор)
-#define AS_VERSION   "1.2"
+// Версия индикатора: повышать при каждом коммите (сейчас 1.3 — минор)
+#define AS_VERSION   "1.3"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
-#define AS_TITLE_OBJ "TITLE"   // суффикс к InpPrefix — подпись названия
-#define AS_RSI_CANVAS "RSI_CV" // bitmap sparkline RSI
-#define AS_RSI_LABEL  "RSI_LB" // число RSI
+#define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
 #include <Canvas/Canvas.mqh>
 
@@ -92,20 +90,26 @@ input string InpSep7                 = "======== ЗОНЫ ИНТЕРЕСОВ (Fi
 input bool   InpShowInterestZones    = true;      // Показывать зоны покупателей/продавцов
 input color  InpBuyZoneColor         = C'173,216,230'; // Зона покупателей (нежно-голубой)
 input color  InpSellZoneColor        = C'255,182,193'; // Зона продавцов (нежно-розовый)
-input int    InpZoneAlpha            = 60;        // Прозрачность заливки зоны (0-255)
+input int    InpZoneAlpha            = 70;        // Прозрачность НЕДОСТИГНУТОЙ зоны (0-255)
+input int    InpZoneTouchedAlpha     = 45;        // Прозрачность ЗАТРОНУТОЙ (не пробитой) зоны
+input bool   InpZoneHideBroken       = true;      // Не рисовать зоны, пробитые ценой (ликвидность снята)
+input bool   InpZoneHatchTouched     = true;      // Штриховать затронутые, но не пробитые зоны
+input int    InpZoneHatchLines       = 6;         // Число линий штриховки
 input double InpFibLevel             = 0.382;     // Уровень Фибоначчи зоны интересов
 
 input string InpSepRSI               = "======== RSI HUD (как Sniper) ========"; // —
 input bool   InpShowRSI              = true;      // Показывать RSI в правом верхнем углу
 input int    InpRSIPeriod            = 14;        // Период RSI
 input bool   InpRSIUseM15            = false;     // RSI на M15 (false = ТФ графика)
-input int    InpRSISparkBars         = 40;        // Баров в мини-графике RSI
-input int    InpRSISparkWidth        = 56;        // Ширина мини-графика (px)
-input int    InpRSISparkHeight       = 22;        // Высота мини-графика (px)
-input int    InpRSIFontSize          = 14;        // Размер шрифта числа RSI
+input int    InpRSISparkBars         = 48;        // Баров в мини-графике RSI
+input int    InpRSIPanelWidth        = 118;       // Ширина панели RSI (px)
+input int    InpRSIPanelHeight       = 30;        // Высота панели RSI (px)
+input int    InpRSISparkWidth        = 70;        // Ширина мини-графика внутри панели (px)
+input int    InpRSIFontSize          = 16;        // Размер шрифта числа RSI
 input color  InpRSIColorMid          = C'34,139,34';   // Зелёный (35..65)
-input color  InpRSIColorWarn         = C'204,153,0';   // Жёлтый читаемый на белом (30-35, 65-70)
-input color  InpRSIColorExt          = clrCrimson;     // Красный (<30, >70)
+input color  InpRSIColorWarn         = C'184,134,11';  // Тёмно-золотой (читаем на белом)
+input color  InpRSIColorExt          = C'178,34,34';   // Красный (<30, >70)
+input color  InpRSIPanelBg           = clrWhite;       // Фон панели RSI
 
 input string InpSep8                 = "======== ПРЕФИКС ОБЪЕКТОВ ========"; // —
 input string InpPrefix               = "AS_";     // Префикс графических объектов
@@ -137,6 +141,13 @@ enum ENUM_DIR
    DIR_NONE = 0,
    DIR_UP,
    DIR_DOWN
+  };
+
+enum ENUM_ZONE_STATE
+  {
+   ZONE_FRESH = 0,   // цена ещё не заходила — ликвидность цела
+   ZONE_TOUCHED,     // зашла, но не пробила — частично снята
+   ZONE_BROKEN       // пробила закрытием — ликвидность собрана
   };
 
 //+------------------------------------------------------------------+
@@ -318,20 +329,17 @@ public:
       m_prefix = prefix;
      }
 
-   void DeleteAll(void)
+   // include_hud=false при пересчёте (RSI не мигает);
+   // include_hud=true при удалении индикатора — стереть всё с префиксом
+   void DeleteAll(const bool include_hud = false)
      {
-      // Не трогаем HUD (название, RSI) — иначе мигает каждый пересчёт
-      int total = ObjectsTotal(m_chart, 0, -1);
+      int total = ObjectsTotal(m_chart, -1, -1);
       for(int i = total - 1; i >= 0; i--)
         {
-         string nm = ObjectName(m_chart, i, 0, -1);
+         string nm = ObjectName(m_chart, i, -1, -1);
          if(StringFind(nm, m_prefix) != 0)
             continue;
-         if(StringFind(nm, AS_TITLE_OBJ) >= 0)
-            continue;
-         if(StringFind(nm, AS_RSI_CANVAS) >= 0)
-            continue;
-         if(StringFind(nm, AS_RSI_LABEL) >= 0)
+         if(!include_hud && StringFind(nm, AS_RSI_CANVAS) >= 0)
             continue;
          ObjectDelete(m_chart, nm);
         }
@@ -388,6 +396,34 @@ public:
       ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 0, p1);
       ObjectSetInteger(m_chart, full, OBJPROP_TIME, 1, t2);
       ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 1, p2);
+      return true;
+     }
+
+   // Диагональная штриховка внутри прямоугольника (затронутая зона)
+   bool HatchZone(const string base, datetime t1, double p1, datetime t2, double p2,
+                  const color clr, const int count)
+     {
+      double lo = MathMin(p1, p2);
+      double hi = MathMax(p1, p2);
+      long   span = (long)(t2 - t1);
+      if(count <= 0 || span <= 0 || hi - lo < _Point)
+         return false;
+
+      for(int k = 0; k < count; k++)
+        {
+         double f  = (k + 0.5) / count;
+         // параллельные диагонали слева-снизу → справа-вверх
+         datetime ta = t1 + (datetime)(long)(span * f * 0.35);
+         datetime tb = t2 - (datetime)(long)(span * (1.0 - f) * 0.15);
+         if(tb <= ta)
+            tb = t2;
+         double pa = lo + (hi - lo) * (f * 0.15);
+         double pb = hi - (hi - lo) * ((1.0 - f) * 0.15);
+         string nm = base + IntegerToString(k);
+         if(!Trend(nm, ta, pa, tb, pb, clr, 1, STYLE_DOT, false))
+            continue;
+         ObjectSetInteger(m_chart, m_prefix + nm, OBJPROP_BACK, true);
+        }
       return true;
      }
 
@@ -1120,6 +1156,78 @@ public:
         }
      }
 
+   // Состояние зоны по ликвидности: FRESH / TOUCHED / BROKEN
+   ENUM_ZONE_STATE AssessZone(const SContinued &c, const MqlRates &rates[],
+                              const int total, double &z_lo, double &z_hi) const
+     {
+      double span = c.price_break - c.unbroken_kz;
+      double fib  = c.unbroken_kz + span * InpFibLevel;
+      z_lo = MathMin(c.unbroken_kz, fib);
+      z_hi = MathMax(c.unbroken_kz, fib);
+
+      bool touched = false;
+      bool broken  = false;
+
+      for(int i = 0; i < total; i++)
+        {
+         if(rates[i].time < c.time_start)
+            continue;
+
+         // касание: бар пересекает полосу зоны
+         if(rates[i].low <= z_hi && rates[i].high >= z_lo)
+            touched = true;
+
+         // пробой: тень ушла за дальнюю границу — ликвидность за зоной снята
+         if(c.direction == DIR_UP)
+           {
+            if(rates[i].low < z_lo)
+               broken = true;
+           }
+         else if(c.direction == DIR_DOWN)
+           {
+            if(rates[i].high > z_hi)
+               broken = true;
+           }
+        }
+
+      if(broken)
+         return ZONE_BROKEN;
+      if(touched)
+         return ZONE_TOUCHED;
+      return ZONE_FRESH;
+     }
+
+   void DrawZone(CChartObjects &gfx, const int idx, const SContinued &c,
+                 const MqlRates &rates[], const int total,
+                 const datetime now_broker, const datetime zt2)
+     {
+      if(!InpShowInterestZones)
+         return;
+
+      double z_lo, z_hi;
+      ENUM_ZONE_STATE st = AssessZone(c, rates, total, z_lo, z_hi);
+
+      // Пробитые — не рисуем (ликвидность собрана, ориентир потерян)
+      if(st == ZONE_BROKEN && InpZoneHideBroken)
+         return;
+
+      color zclr = (c.direction == DIR_UP) ? InpBuyZoneColor : InpSellZoneColor;
+      zclr = ApplyFade(zclr, c.time_start, now_broker);
+      int za = (st == ZONE_TOUCHED) ? InpZoneTouchedAlpha : InpZoneAlpha;
+
+      string zname = "CM_Z_" + IntegerToString(idx);
+      gfx.Rectangle(zname, c.time_start, z_lo, zt2, z_hi, zclr, za);
+
+      // Затронутые, но не пробитые — диагональная штриховка (отличие от FRESH)
+      if(st == ZONE_TOUCHED && InpZoneHatchTouched)
+        {
+         color hclr = (c.direction == DIR_UP) ? C'70,130,180' : C'180,80,100';
+         hclr = ApplyFade(hclr, c.time_start, now_broker);
+         gfx.HatchZone("CM_ZH" + IntegerToString(idx) + "_",
+                       c.time_start, z_lo, zt2, z_hi, hclr, InpZoneHatchLines);
+        }
+     }
+
    void Draw(CChartObjects &gfx, const MqlRates &rates[], const int total, const datetime now_broker)
      {
       if(!InpShowContinued)
@@ -1143,6 +1251,7 @@ public:
          const bool hide_lines = sniper_hist
                                 ? c.obsolete
                                 : ((InpHideObsoleteCM && c.obsolete) || (i < first_lines));
+         // Зону показываем и у obsolete (Sniper), если не пробита (см. DrawZone)
          const bool show_zone = InpShowInterestZones &&
                                 (sniper_hist ? (InpKeepObsoleteZones || !c.obsolete)
                                              : !c.obsolete);
@@ -1152,6 +1261,9 @@ public:
          datetime t_end_pt = (c.end_bar >= 0 && c.end_bar < total) ? rates[c.end_bar].time
                             : ((c.time_end != 0) ? c.time_end : rates[total - 1].time);
          datetime t_h_end  = t_end_pt + PeriodSeconds(WORK_TF);
+         datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
+         if(zt2 < t_h_end)
+            zt2 = t_h_end;
 
          if(!hide_lines)
            {
@@ -1177,39 +1289,10 @@ public:
                                 c.time_end, t_h_end + PeriodSeconds(WORK_TF) * 4, c.price_end,
                                 clr, InpContWidth, InpContStyle);
               }
+           }
 
-            // Зона интересов Fib 38.2% (в стиле Sniper — и у прежних ПД)
-            if(show_zone)
-              {
-               double span = c.price_break - c.unbroken_kz;
-               double fib  = c.unbroken_kz + span * InpFibLevel;
-               color zclr = (c.direction == DIR_UP) ? InpBuyZoneColor : InpSellZoneColor;
-               zclr = ApplyFade(zclr, c.time_start, now_broker);
-               int za = InpZoneAlpha;
-               if(c.obsolete && sniper_hist)
-                  za = MathMax(25, InpZoneAlpha * 2 / 3);
-               // Как в Sniper: зона тянется вправо к текущему времени
-               datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
-               if(zt2 < t_h_end)
-                  zt2 = t_h_end;
-               gfx.Rectangle("CM_Z_" + IntegerToString(i),
-                             c.time_start, c.unbroken_kz,
-                             zt2, fib,
-                             zclr, za);
-              }
-           }
-         else if(show_zone)
-           {
-            double span = c.price_break - c.unbroken_kz;
-            double fib  = c.unbroken_kz + span * InpFibLevel;
-            color zclr = (c.direction == DIR_UP) ? InpBuyZoneColor : InpSellZoneColor;
-            zclr = ApplyFade(zclr, c.time_start, now_broker);
-            datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
-            gfx.Rectangle("CM_Z_" + IntegerToString(i),
-                          c.time_start, c.unbroken_kz,
-                          zt2, fib,
-                          zclr, InpZoneAlpha);
-           }
+         if(show_zone)
+            DrawZone(gfx, i, c, rates, total, now_broker, zt2);
 
          // Курсор: синий вверх / красный вниз + размер в пунктах (как «160.64» в образце)
          if(InpShowContCursor)
@@ -1254,30 +1337,6 @@ color RSIValueColor(const double rsi)
   }
 
 //+------------------------------------------------------------------+
-//| Подпись названия+версии в правом верхнем углу                    |
-//+------------------------------------------------------------------+
-void UpdateTitleLabel(void)
-  {
-   string name = InpPrefix + AS_TITLE_OBJ;
-   if(ObjectFind(0, name) < 0)
-     {
-      if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
-         return;
-     }
-   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
-   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
-   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 8);
-   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 14);
-   ObjectSetString(0, name, OBJPROP_TEXT, AS_SHORTNAME);
-   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
-   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, clrDimGray);
-   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, name, OBJPROP_BACK, false);
-  }
-
-//+------------------------------------------------------------------+
 //| Инициализация / уничтожение RSI HUD                              |
 //+------------------------------------------------------------------+
 bool InitRSIHud(void)
@@ -1293,8 +1352,14 @@ bool InitRSIHud(void)
       return false;
      }
 
+   // Снести артефакты старых версий (label RSI / кастомный TITLE)
+   ObjectDelete(0, InpPrefix + "RSI_LB");
+   ObjectDelete(0, InpPrefix + "TITLE");
+
    string cname = InpPrefix + AS_RSI_CANVAS;
-   if(!g_rsi_canvas.CreateBitmapLabel(cname, 0, 0, InpRSISparkWidth, InpRSISparkHeight,
+   ObjectDelete(0, cname);
+   if(!g_rsi_canvas.CreateBitmapLabel(cname, 0, 0,
+                                      InpRSIPanelWidth, InpRSIPanelHeight,
                                       COLOR_FORMAT_ARGB_NORMALIZE))
      {
       Print("ActeckSmart: Canvas RSI не создан, err=", GetLastError());
@@ -1302,10 +1367,12 @@ bool InitRSIHud(void)
      }
    ObjectSetInteger(0, cname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
    ObjectSetInteger(0, cname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
-   ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 8 + 40);
-   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 36);
+   ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 10);
+   // Ниже системного имени индикатора (кликабельное SHORTNAME)
+   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 22);
    ObjectSetInteger(0, cname, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, cname, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, cname, OBJPROP_BACK, false);
    g_rsi_canvas_ok = true;
    return true;
   }
@@ -1322,16 +1389,17 @@ void DeinitRSIHud(void)
       g_rsi_canvas.Destroy();
       g_rsi_canvas_ok = false;
      }
-   ObjectDelete(0, InpPrefix + AS_RSI_LABEL);
+   ObjectDelete(0, InpPrefix + "RSI_LB");
    ObjectDelete(0, InpPrefix + AS_RSI_CANVAS);
+   ObjectDelete(0, InpPrefix + "TITLE");
   }
 
 //+------------------------------------------------------------------+
-//| Обновление RSI: мини-график слева + число справа (как Sniper)    |
+//| RSI HUD: непрозрачная панель spark + число (стиль Sniper)        |
 //+------------------------------------------------------------------+
 void UpdateRSIHud(void)
   {
-   if(!InpShowRSI || g_rsi_handle == INVALID_HANDLE)
+   if(!InpShowRSI || g_rsi_handle == INVALID_HANDLE || !g_rsi_canvas_ok)
       return;
 
    int need = MathMax(InpRSISparkBars + 5, InpRSIPeriod + 5);
@@ -1343,74 +1411,64 @@ void UpdateRSIHud(void)
    double cur = rsi[0];
    color  clr = RSIValueColor(cur);
 
-   // --- число RSI ---
-   string lname = InpPrefix + AS_RSI_LABEL;
-   if(ObjectFind(0, lname) < 0)
-     {
-      if(!ObjectCreate(0, lname, OBJ_LABEL, 0, 0, 0))
-         return;
-     }
-   ObjectSetInteger(0, lname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
-   ObjectSetInteger(0, lname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
-   ObjectSetInteger(0, lname, OBJPROP_XDISTANCE, 8);
-   ObjectSetInteger(0, lname, OBJPROP_YDISTANCE, 34);
-   ObjectSetString(0, lname, OBJPROP_TEXT, IntegerToString((int)MathRound(cur)));
-   ObjectSetString(0, lname, OBJPROP_FONT, "Arial Bold");
-   ObjectSetInteger(0, lname, OBJPROP_FONTSIZE, InpRSIFontSize);
-   ObjectSetInteger(0, lname, OBJPROP_COLOR, clr);
-   ObjectSetInteger(0, lname, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, lname, OBJPROP_HIDDEN, true);
-
-   // --- sparkline слева от числа ---
-   if(!g_rsi_canvas_ok)
-      return;
-
    string cname = InpPrefix + AS_RSI_CANVAS;
    ObjectSetInteger(0, cname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
    ObjectSetInteger(0, cname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
-   ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 8 + 36);
-   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 36);
+   ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 22);
 
-   const int w = InpRSISparkWidth;
-   const int h = InpRSISparkHeight;
-   g_rsi_canvas.Erase(ColorToARGB(clrWhite, 0)); // прозрачный фон
+   const int pw = InpRSIPanelWidth;
+   const int ph = InpRSIPanelHeight;
+   const int pad = 4;
+   const int gap = 6;
+   const int spark_w = MathMin(InpRSISparkWidth, pw - 36);
+   const int spark_h = ph - pad * 2;
 
-   // рамка/подложка едва заметная
-   g_rsi_canvas.FillRectangle(0, 0, w - 1, h - 1, ColorToARGB(C'250,250,250', 180));
+   // Непрозрачный белый фон — график/сетка не просвечивают сквозь число
+   g_rsi_canvas.Erase(ColorToARGB(InpRSIPanelBg, 255));
+   g_rsi_canvas.Rectangle(0, 0, pw - 1, ph - 1, ColorToARGB(C'200,200,200', 255));
 
    int bars = MathMin(InpRSISparkBars, ArraySize(rsi));
-   if(bars < 2)
+   if(bars >= 2 && spark_w > 4 && spark_h > 4)
      {
-      g_rsi_canvas.Update();
-      return;
+      double rmin = rsi[0], rmax = rsi[0];
+      for(int i = 1; i < bars; i++)
+        {
+         if(rsi[i] < rmin) rmin = rsi[i];
+         if(rsi[i] > rmax) rmax = rsi[i];
+        }
+      if(rmax - rmin < 1.0)
+        {
+         rmin -= 1.0;
+         rmax += 1.0;
+        }
+
+      uint line_clr = ColorToARGB(clr, 255);
+      int  prev_x = 0, prev_y = 0;
+      for(int i = 0; i < bars; i++)
+        {
+         int idx = bars - 1 - i;
+         int x = pad + (int)MathRound((double)i * (spark_w - 1) / (bars - 1));
+         double nrm = (rsi[idx] - rmin) / (rmax - rmin);
+         int y = pad + (int)MathRound((spark_h - 1) * (1.0 - nrm));
+         if(i > 0)
+           {
+            // Толщина ~2px: основная линия + сдвиг на 1px
+            g_rsi_canvas.Line(prev_x, prev_y, x, y, line_clr);
+            g_rsi_canvas.Line(prev_x, prev_y + 1, x, y + 1, line_clr);
+           }
+         prev_x = x;
+         prev_y = y;
+        }
      }
 
-   double rmin = rsi[0], rmax = rsi[0];
-   for(int i = 1; i < bars; i++)
-     {
-      if(rsi[i] < rmin) rmin = rsi[i];
-      if(rsi[i] > rmax) rmax = rsi[i];
-     }
-   if(rmax - rmin < 1.0)
-     {
-      rmin -= 1.0;
-      rmax += 1.0;
-     }
+   // Число RSI справа от spark — на той же непрозрачной панели
+   g_rsi_canvas.FontSet("Arial Bold", InpRSIFontSize);
+   string txt = IntegerToString((int)MathRound(cur));
+   int tx = pad + spark_w + gap;
+   int ty = ph / 2;
+   g_rsi_canvas.TextOut(tx, ty, txt, ColorToARGB(clr, 255), TA_LEFT | TA_VCENTER);
 
-   uint line_clr = ColorToARGB(clr, 255);
-   int prev_x = 0, prev_y = 0;
-   for(int i = 0; i < bars; i++)
-     {
-      // rsi[bars-1] слева → rsi[0] справа
-      int idx = bars - 1 - i;
-      int x = (int)MathRound((double)i * (w - 1) / (bars - 1));
-      double nrm = (rsi[idx] - rmin) / (rmax - rmin);
-      int y = (int)MathRound((h - 2) * (1.0 - nrm)) + 1;
-      if(i > 0)
-         g_rsi_canvas.Line(prev_x, prev_y, x, y, line_clr);
-      prev_x = x;
-      prev_y = y;
-     }
    g_rsi_canvas.Update();
   }
 
@@ -1472,7 +1530,6 @@ void RecalculateAll(void)
    g_kz.Draw(g_gfx, g_rates, total, now_broker);
    g_cont.Draw(g_gfx, g_rates, total, now_broker);
 
-   UpdateTitleLabel();
    UpdateRSIHud();
    ChartRedraw(0);
   }
@@ -1498,13 +1555,17 @@ bool IsNewM15Bar(void)
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   // DRAW_NONE plot нужен, иначе MT5 не показывает имя индикатора на графике
+   // DRAW_NONE + SHORTNAME → системное кликабельное имя (свойства / список / удалить)
    SetIndexBuffer(0, g_dummy_buf, INDICATOR_DATA);
    ArraySetAsSeries(g_dummy_buf, true);
    PlotIndexSetInteger(0, PLOT_DRAW_TYPE, DRAW_NONE);
+   PlotIndexSetInteger(0, PLOT_SHOW_DATA, false);
    PlotIndexSetString(0, PLOT_LABEL, AS_SHORTNAME);
    IndicatorSetString(INDICATOR_SHORTNAME, AS_SHORTNAME);
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
+
+   // Убрать кастомный TITLE со старых версий — он перекрывал системное имя
+   ObjectDelete(0, InpPrefix + "TITLE");
 
    g_gfx.Init(0, InpPrefix);
    g_kz.SetZigZag(GetPointer(g_zz1));
@@ -1515,7 +1576,6 @@ int OnInit()
 
    g_last_m15_bar = 0;
    RecalculateAll();
-   UpdateTitleLabel();
    UpdateRSIHud();
    g_last_m15_bar = iTime(_Symbol, WORK_TF, 0);
    return INIT_SUCCEEDED;
@@ -1523,9 +1583,10 @@ int OnInit()
 
 void OnDeinit(const int reason)
   {
-   g_gfx.DeleteAll();
+   // Сначала canvas, затем все объекты с префиксом (включая RSI/TITLE)
    DeinitRSIHud();
-   ObjectDelete(0, InpPrefix + AS_TITLE_OBJ);
+   g_gfx.DeleteAll(true);
+   ChartRedraw(0);
   }
 
 int OnCalculate(const int rates_total,
@@ -1539,6 +1600,10 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
   {
+   // Пустой буфер — plot невидим, но SHORTNAME остаётся кликабельным
+   if(rates_total > 0)
+      ArrayInitialize(g_dummy_buf, EMPTY_VALUE);
+
    // RSI HUD — на каждом тике (как у Sniper)
    UpdateRSIHud();
 
