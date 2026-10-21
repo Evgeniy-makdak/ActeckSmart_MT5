@@ -5,16 +5,16 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.9"
-#property description "ActeckSmart v1.9 — КЗ, СПД и уровни полос Боллинджера"
+#property version   "1.10"
+#property description "ActeckSmart v1.10 — КЗ, модели расширения и сигналы входа"
 #property indicator_chart_window
-#property indicator_buffers 1
+#property indicator_buffers 7
 #property indicator_plots   1
 #property indicator_type1   DRAW_NONE
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.9"
+#define AS_VERSION   "1.10"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -106,6 +106,17 @@ input color  InpBBUpperColor         = clrRed;    // Верхняя полоса
 input color  InpBBMiddleColor        = clrLimeGreen; // Центральная полоса
 input color  InpBBLowerColor         = clrBlue;   // Нижняя полоса
 
+input string InpSepSignals           = "======== СИГНАЛЫ РАСШИРЕНИЯ ========"; // —
+input bool   InpEnableBaseSignals    = true;      // Сигналы базового расширения
+input bool   InpEnableCascadeSignals = true;      // Сигналы каскадного расширения
+input double InpBaseEntryFib         = 0.382;     // Глубина зоны входа базовой модели
+input double InpCascadeEntryFib      = 0.236;     // Глубина зоны входа каскада
+input int    InpSignalHistoryBars    = 3000;      // История сигналов на текущем ТФ
+input int    InpSignalStopBuffer     = 2;         // Буфер SL за экстремумом (пункты)
+input int    InpSignalLevelBars      = 12;        // Длина линий SL/TP (баров текущего ТФ)
+input bool   InpSignalAlerts         = true;      // Алерт нового сигнала
+input bool   InpShowSignalLevels     = true;      // Показывать уровни SL/TP на графике
+
 input string InpSepRSI               = "======== RSI HUD (как Sniper) ========"; // —
 input bool   InpShowRSI              = true;      // Показывать RSI в правом верхнем углу
 input int    InpRSIPeriod            = 14;        // Период RSI
@@ -127,6 +138,12 @@ input string InpPrefix               = "AS_";     // Префикс графич
 //| Константы и перечисления                                         |
 //+------------------------------------------------------------------+
 #define WORK_TF PERIOD_M15
+
+enum ENUM_SIGNAL_MODEL
+  {
+   SIGNAL_MODEL_BASE = 1,
+   SIGNAL_MODEL_CASCADE = 2
+  };
 
 enum ENUM_SESSION
   {
@@ -204,8 +221,29 @@ struct SContinued
    double   size_points;      // размер движения в пунктах (подпись курсора)
   };
 
+struct STradeSignal
+  {
+   datetime time;
+   datetime setup_time;
+   ENUM_DIR direction;
+   ENUM_SIGNAL_MODEL model;
+   double entry;
+   double stop_loss;
+   double take_profit_1;
+   double take_profit_2;
+  };
+
 bool     g_allow_cont_alerts = false;
 datetime g_last_cont_alert_time = 0;
+datetime g_last_signal_chart_bar = 0;
+datetime g_last_trade_signal_time = 0;
+double   g_signal_direction[];
+double   g_signal_stop[];
+double   g_signal_tp1[];
+double   g_signal_tp2[];
+double   g_signal_model[];
+double   g_signal_processed_time[];
+MqlRates g_signal_rates[];
 
 //+------------------------------------------------------------------+
 //| Вспомогательные функции времени и сессий                         |
@@ -858,6 +896,38 @@ public:
       return GetBalanceRangeAt(0, high_kz, low_kz, idx_high, idx_low, bal);
      }
 
+   bool GetNearestTarget(const ENUM_DIR direction, const datetime at_time,
+                        const double entry, double &target) const
+     {
+      target = 0.0;
+      double nearest = DBL_MAX;
+      for(int i = 0; i < ArraySize(m_kz); i++)
+        {
+         if(m_kz[i].time_confirm > at_time ||
+            (m_kz[i].time_end != 0 && m_kz[i].time_end <= at_time))
+            continue;
+         if(direction == DIR_UP && m_kz[i].is_high && m_kz[i].price > entry)
+           {
+            double distance = m_kz[i].price - entry;
+            if(distance < nearest)
+              {
+               nearest = distance;
+               target = m_kz[i].price;
+              }
+           }
+         else if(direction == DIR_DOWN && !m_kz[i].is_high && m_kz[i].price < entry)
+           {
+            double distance = entry - m_kz[i].price;
+            if(distance < nearest)
+              {
+               nearest = distance;
+               target = m_kz[i].price;
+              }
+           }
+        }
+      return (nearest < DBL_MAX);
+     }
+
    // Встречная КЗ, подтверждённая после начала ПД.
    bool FindOpposingKZ(const datetime t_from, const datetime t_to,
                        const ENUM_DIR cm_dir, int &idx_out) const
@@ -991,6 +1061,161 @@ public:
       cur.size_points = MathAbs(cur.price_end - cur.price_break) / _Point;
       AddItem(cur);
       MarkObsoleteExceptLast();
+     }
+
+   int CountNewZones(const datetime after, const datetime through) const
+     {
+      int count = 0;
+      for(int i = 0; i < m_kz.KZCount(); i++)
+        {
+         SKZ zone = m_kz.KZAt(i);
+         if(zone.time_confirm > after && zone.time_confirm <= through)
+            count++;
+        }
+      return count;
+     }
+
+   void BuildSignals(const MqlRates &chart_rates[], const int total,
+                     STradeSignal &signals[]) const
+     {
+      ArrayResize(signals, 0);
+      if(m_kz == NULL || total <= 0)
+         return;
+      double min_stop_points = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      double stop_buffer = MathMax((double)InpSignalStopBuffer, min_stop_points) * _Point;
+
+      for(int i = 0; i < ArraySize(m_items); i++)
+        {
+         SContinued item = m_items[i];
+         if(!item.closed || item.time_end == 0)
+            continue;
+
+         if(i == 0 || !m_items[i - 1].closed)
+            continue;
+
+         SContinued previous = m_items[i - 1];
+         ENUM_SIGNAL_MODEL model;
+         double impulse_start = item.price_break;
+         double impulse_end = item.price_end;
+         // Два однонаправленных движения с двумя новыми КЗ образуют каскад;
+         // противоположные последовательные движения подтверждают базовую модель.
+         if(previous.direction == item.direction &&
+            previous.time_end < item.time_start &&
+            CountNewZones(previous.time_end, item.time_end) >= 2)
+           {
+            model = SIGNAL_MODEL_CASCADE;
+            impulse_start = previous.price_break;
+            impulse_end = item.price_end;
+           }
+         else if(previous.direction != item.direction &&
+                 previous.time_end < item.time_start)
+            model = SIGNAL_MODEL_BASE;
+         else
+            continue;
+
+         if((model == SIGNAL_MODEL_BASE && !InpEnableBaseSignals) ||
+            (model == SIGNAL_MODEL_CASCADE && !InpEnableCascadeSignals))
+            continue;
+
+         double impulse = MathAbs(impulse_end - impulse_start);
+         if(impulse <= _Point)
+            continue;
+
+         double fib = (model == SIGNAL_MODEL_CASCADE)
+                      ? InpCascadeEntryFib : InpBaseEntryFib;
+         if(fib <= 0.0 || fib >= 1.0)
+            continue;
+
+         double zone_low, zone_high;
+         if(item.direction == DIR_UP)
+           {
+            zone_low = impulse_end - impulse * fib;
+            zone_high = impulse_end;
+           }
+         else
+           {
+            zone_low = impulse_end;
+            zone_high = impulse_end + impulse * fib;
+           }
+
+         for(int bar = 0; bar < total; bar++)
+           {
+            if(chart_rates[bar].time <= item.time_end)
+               continue;
+            if(item.direction == DIR_UP && chart_rates[bar].low <= impulse_start)
+              {
+               break;
+              }
+            if(item.direction == DIR_DOWN && chart_rates[bar].high >= impulse_start)
+               break;
+            if(chart_rates[bar].low > zone_high || chart_rates[bar].high < zone_low)
+               continue;
+
+            double entry = chart_rates[bar].close;
+            double stop = (item.direction == DIR_UP)
+                          ? chart_rates[bar].low - stop_buffer
+                          : chart_rates[bar].high + stop_buffer;
+            double risk_distance = MathAbs(entry - stop);
+            if(risk_distance <= _Point)
+               break;
+
+            double target = 0.0;
+            if(!m_kz.GetNearestTarget(item.direction, chart_rates[bar].time,
+                                      entry, target))
+               break;
+
+            double tp1 = (item.direction == DIR_UP) ? entry + risk_distance
+                                                    : entry - risk_distance;
+            double tp2 = (item.direction == DIR_UP) ? entry + risk_distance * 2.0
+                                                    : entry - risk_distance * 2.0;
+            if((item.direction == DIR_UP && target < tp2) ||
+               (item.direction == DIR_DOWN && target > tp2))
+               break;
+
+            STradeSignal signal;
+            signal.time = chart_rates[bar].time;
+            signal.setup_time = item.time_end;
+            signal.direction = item.direction;
+            signal.model = model;
+            signal.entry = entry;
+            signal.stop_loss = NormalizeDouble(stop, _Digits);
+            signal.take_profit_1 = NormalizeDouble(tp1, _Digits);
+            signal.take_profit_2 = NormalizeDouble(tp2, _Digits);
+
+            int n = ArraySize(signals);
+            ArrayResize(signals, n + 1);
+            signals[n] = signal;
+            break;
+           }
+        }
+
+      for(int i = 0; i < ArraySize(signals) - 1; i++)
+         for(int j = i + 1; j < ArraySize(signals); j++)
+            if(signals[j].time < signals[i].time)
+              {
+               STradeSignal swap = signals[i];
+               signals[i] = signals[j];
+               signals[j] = swap;
+              }
+
+      // Не допускаем несколько входов на одном баре: берём сигнал от самой
+      // поздней подтверждённой модели.
+      int write = 0;
+      for(int i = 0; i < ArraySize(signals);)
+        {
+         int best = i;
+         int next = i + 1;
+         while(next < ArraySize(signals) && signals[next].time == signals[i].time)
+           {
+            if(signals[next].setup_time > signals[best].setup_time)
+               best = next;
+            next++;
+           }
+         signals[write] = signals[best];
+         write++;
+         i = next;
+        }
+      ArrayResize(signals, write);
      }
 
    void Build(const MqlRates &rates[], const int total)
@@ -1596,6 +1821,96 @@ void RecalculateAll(void)
    ChartRedraw(0);
   }
 
+void DrawTradeSignal(const STradeSignal &signal)
+  {
+   string key = IntegerToString((long)signal.time);
+   color signal_color = (signal.direction == DIR_UP) ? clrDodgerBlue : clrRed;
+   g_gfx.CursorArrow("SG_A_" + key, signal.time, signal.entry,
+                     signal.direction, signal_color);
+
+   if(InpShowSignalLevels)
+     {
+      datetime line_end = signal.time + PeriodSeconds((ENUM_TIMEFRAMES)_Period) *
+                          InpSignalLevelBars;
+      g_gfx.HLineSegment("SG_SL_" + key, signal.time, line_end, signal.stop_loss,
+                         clrRed, 2, STYLE_SOLID);
+      g_gfx.HLineSegment("SG_TP1_" + key, signal.time, line_end,
+                         signal.take_profit_1, clrLimeGreen, 2, STYLE_SOLID);
+      g_gfx.HLineSegment("SG_TP2_" + key, signal.time, line_end,
+                         signal.take_profit_2, clrDodgerBlue, 2, STYLE_DASH);
+     }
+
+   string model = (signal.model == SIGNAL_MODEL_CASCADE) ? "КАСКАД" : "БАЗОВАЯ";
+   string side = (signal.direction == DIR_UP) ? "BUY" : "SELL";
+   double label_price = (signal.direction == DIR_UP)
+                        ? signal.entry - 6.0 * _Point : signal.entry + 6.0 * _Point;
+   g_gfx.TextLabel("SG_TX_" + key, signal.time, label_price,
+                   model + " " + side, signal_color,
+                   InpKZFont, InpKZFontSize);
+  }
+
+void ProcessTradeSignals(const bool alert_latest)
+  {
+   ArrayInitialize(g_signal_direction, EMPTY_VALUE);
+   ArrayInitialize(g_signal_stop, EMPTY_VALUE);
+   ArrayInitialize(g_signal_tp1, EMPTY_VALUE);
+   ArrayInitialize(g_signal_tp2, EMPTY_VALUE);
+   ArrayInitialize(g_signal_model, EMPTY_VALUE);
+   ArrayInitialize(g_signal_processed_time, EMPTY_VALUE);
+   ObjectsDeleteAll(ChartID(), InpPrefix + "SG_", -1, -1);
+
+   int requested = MathMax(InpSignalHistoryBars, 100);
+   ArraySetAsSeries(g_signal_rates, false);
+   ResetLastError();
+   int copied = CopyRates(_Symbol, (ENUM_TIMEFRAMES)_Period, 0,
+                          requested, g_signal_rates);
+   if(copied < 3)
+     {
+      Print("ActeckSmart: недостаточно баров текущего ТФ для сигналов, err=",
+            GetLastError());
+      return;
+     }
+
+   int closed_count = copied - 1;
+   datetime latest_closed_time = g_signal_rates[closed_count - 1].time;
+   for(int i = 0; i < closed_count; i++)
+     {
+      int shift = closed_count - i;
+      if(shift < ArraySize(g_signal_processed_time))
+         g_signal_processed_time[shift] = (double)g_signal_rates[i].time;
+     }
+   STradeSignal signals[];
+   g_cont.BuildSignals(g_signal_rates, closed_count, signals);
+   for(int i = 0; i < ArraySize(signals); i++)
+     {
+      STradeSignal signal = signals[i];
+
+      int shift = iBarShift(_Symbol, (ENUM_TIMEFRAMES)_Period, signal.time, true);
+      if(shift < 1 || shift >= ArraySize(g_signal_direction))
+         continue;
+
+      g_signal_direction[shift] = (signal.direction == DIR_UP) ? 1.0 : -1.0;
+      g_signal_stop[shift] = signal.stop_loss;
+      g_signal_tp1[shift] = signal.take_profit_1;
+      g_signal_tp2[shift] = signal.take_profit_2;
+      g_signal_model[shift] = (double)signal.model;
+      DrawTradeSignal(signal);
+
+      if(alert_latest && InpSignalAlerts && signal.time == latest_closed_time &&
+         signal.time != g_last_trade_signal_time)
+        {
+         string direction = (signal.direction == DIR_UP) ? "ПОКУПКА" : "ПРОДАЖА";
+         string model = (signal.model == SIGNAL_MODEL_CASCADE) ? "каскадное" : "базовое";
+         Alert("ActeckSmart: ", direction, " / ", model, " расширение / ",
+               _Symbol, " / ", EnumToString((ENUM_TIMEFRAMES)_Period),
+               " / SL ", DoubleToString(signal.stop_loss, _Digits),
+               " / TP1 ", DoubleToString(signal.take_profit_1, _Digits),
+               " / TP2 ", DoubleToString(signal.take_profit_2, _Digits));
+         g_last_trade_signal_time = signal.time;
+        }
+     }
+  }
+
 //+------------------------------------------------------------------+
 //| Проверка нового бара M15                                         |
 //+------------------------------------------------------------------+
@@ -1619,12 +1934,33 @@ int OnInit()
   {
    // DRAW_NONE + SHORTNAME → системное кликабельное имя (свойства / список / удалить)
    SetIndexBuffer(0, g_dummy_buf, INDICATOR_DATA);
+   SetIndexBuffer(1, g_signal_direction, INDICATOR_DATA);
+   SetIndexBuffer(2, g_signal_stop, INDICATOR_DATA);
+   SetIndexBuffer(3, g_signal_tp1, INDICATOR_DATA);
+   SetIndexBuffer(4, g_signal_tp2, INDICATOR_DATA);
+   SetIndexBuffer(5, g_signal_model, INDICATOR_DATA);
+   SetIndexBuffer(6, g_signal_processed_time, INDICATOR_DATA);
    ArraySetAsSeries(g_dummy_buf, true);
+   ArraySetAsSeries(g_signal_direction, true);
+   ArraySetAsSeries(g_signal_stop, true);
+   ArraySetAsSeries(g_signal_tp1, true);
+   ArraySetAsSeries(g_signal_tp2, true);
+   ArraySetAsSeries(g_signal_model, true);
+   ArraySetAsSeries(g_signal_processed_time, true);
    PlotIndexSetInteger(0, PLOT_DRAW_TYPE, DRAW_NONE);
    PlotIndexSetInteger(0, PLOT_SHOW_DATA, false);
    PlotIndexSetString(0, PLOT_LABEL, AS_SHORTNAME);
    IndicatorSetString(INDICATOR_SHORTNAME, AS_SHORTNAME);
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
+
+   if(InpBaseEntryFib <= 0.0 || InpBaseEntryFib >= 1.0 ||
+      InpCascadeEntryFib <= 0.0 || InpCascadeEntryFib >= 1.0 ||
+      InpSignalHistoryBars < 10 || InpSignalStopBuffer < 0 ||
+      InpSignalLevelBars < 1)
+     {
+      Print("ActeckSmart: некорректные параметры сигналов");
+      return INIT_PARAMETERS_INCORRECT;
+     }
 
    g_gfx.Init(ChartID(), InpPrefix);
    // Снести артефакты прошлой сессии / старых версий (TITLE, RSI_LB, AS_*)
@@ -1641,8 +1977,11 @@ int OnInit()
 
    g_last_m15_bar = 0;
    RecalculateAll();
+   ProcessTradeSignals(false);
    UpdateRSIHud();
    g_last_m15_bar = iTime(_Symbol, WORK_TF, 0);
+   g_last_signal_chart_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 0);
+   g_allow_cont_alerts = true;
    return INIT_SUCCEEDED;
   }
 
@@ -1701,19 +2040,30 @@ int OnCalculate(const int rates_total,
      {
       RecalculateAll();
       DrawBollingerLevels(g_m15_closed_count);
+      ProcessTradeSignals(false);
       g_last_m15_bar = iTime(_Symbol, WORK_TF, 0);
+      g_last_signal_chart_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 0);
       g_allow_cont_alerts = true;
       return rates_total;
      }
 
-   datetime t0 = iTime(_Symbol, WORK_TF, 0);
-   if(t0 != 0 && t0 != g_last_m15_bar)
+   datetime current_m15_bar = iTime(_Symbol, WORK_TF, 0);
+   bool new_m15_bar = (current_m15_bar != 0 && current_m15_bar != g_last_m15_bar);
+   if(new_m15_bar)
      {
-      g_last_m15_bar = t0;
+      g_last_m15_bar = current_m15_bar;
       RecalculateAll();
      }
    if(InpShowBollingerLevels && !g_bollinger_drawn)
       DrawBollingerLevels(g_m15_closed_count);
+   datetime current_chart_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 0);
+   bool new_chart_bar = (current_chart_bar != 0 &&
+                         current_chart_bar != g_last_signal_chart_bar);
+   if(new_chart_bar || new_m15_bar)
+     {
+      ProcessTradeSignals(new_chart_bar && g_allow_cont_alerts);
+      g_last_signal_chart_bar = current_chart_bar;
+     }
    return rates_total;
   }
 
