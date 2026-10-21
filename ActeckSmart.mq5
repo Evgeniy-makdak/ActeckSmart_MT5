@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.8"
-#property description "ActeckSmart v1.8 — подтверждённые КЗ и расчёт СПД без заглядывания вперёд"
+#property version   "1.9"
+#property description "ActeckSmart v1.9 — КЗ, СПД и уровни полос Боллинджера"
 #property indicator_chart_window
 #property indicator_buffers 1
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.8"
+#define AS_VERSION   "1.9"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -95,6 +95,16 @@ input int    InpZoneTouchedAlpha     = 45;        // Непрозрачност�
 input bool   InpZoneHideBroken       = true;      // Не рисовать зоны, пробитые ценой (ликвидность снята)
 input bool   InpZoneShowStateLabel   = true;      // Показывать метку состояния зоны
 input double InpFibLevel             = 0.382;     // Уровень Фибоначчи зоны интересов
+
+input string InpSepBB                = "======== ПОЛОСЫ БОЛЛИНДЖЕРА (M15) ========"; // —
+input bool   InpShowBollingerLevels  = true;      // Показывать уровни полос Боллинджера
+input int    InpBBPeriod             = 100;       // Период Bollinger Bands
+input double InpBBDeviation          = 2.0;       // Стандартное отклонение
+input int    InpBBLineBars           = 8;         // Длина коротких линий (баров M15)
+input int    InpBBLineWidth          = 2;         // Толщина линий (1-5)
+input color  InpBBUpperColor         = clrRed;    // Верхняя полоса
+input color  InpBBMiddleColor        = clrLimeGreen; // Центральная полоса
+input color  InpBBLowerColor         = clrBlue;   // Нижняя полоса
 
 input string InpSepRSI               = "======== RSI HUD (как Sniper) ========"; // —
 input bool   InpShowRSI              = true;      // Показывать RSI в правом верхнем углу
@@ -1287,8 +1297,81 @@ datetime          g_last_m15_bar = 0;
 MqlRates          g_rates[];
 double            g_dummy_buf[];   // служебный буфер — чтобы MT5 показал имя индикатора
 int               g_rsi_handle = INVALID_HANDLE;
+int               g_bollinger_handle = INVALID_HANDLE;
+int               g_m15_closed_count = 0;
+datetime          g_last_bollinger_error_bar = 0;
+bool              g_bollinger_drawn = false;
 CCanvas           g_rsi_canvas;
 bool              g_rsi_canvas_ok = false;
+
+bool InitBollingerLevels(void)
+  {
+   if(!InpShowBollingerLevels)
+      return true;
+   if(InpBBPeriod < 2 || InpBBDeviation <= 0.0 ||
+      InpBBLineBars < 1 || InpBBLineWidth < 1 || InpBBLineWidth > 5)
+     {
+      Print("ActeckSmart: некорректные параметры полос Боллинджера");
+      return false;
+     }
+
+   g_bollinger_handle = iBands(_Symbol, WORK_TF, InpBBPeriod, 0,
+                               InpBBDeviation, PRICE_CLOSE);
+   if(g_bollinger_handle == INVALID_HANDLE)
+     {
+      Print("ActeckSmart: не удалось создать handle полос Боллинджера, err=",
+            GetLastError());
+      return false;
+     }
+   return true;
+  }
+
+void DrawBollingerLevels(const int total)
+  {
+   if(!InpShowBollingerLevels || g_bollinger_handle == INVALID_HANDLE || total <= 0)
+      return;
+   if(g_bollinger_drawn)
+      return;
+   if(BarsCalculated(g_bollinger_handle) < InpBBPeriod + 1)
+      return;
+
+   double middle[1], upper[1], lower[1];
+   ResetLastError();
+   if(CopyBuffer(g_bollinger_handle, 0, 1, 1, middle) != 1 ||
+      CopyBuffer(g_bollinger_handle, 1, 1, 1, upper) != 1 ||
+      CopyBuffer(g_bollinger_handle, 2, 1, 1, lower) != 1)
+     {
+      datetime error_bar = g_rates[total - 1].time;
+      if(g_last_bollinger_error_bar != error_bar)
+        {
+         Print("ActeckSmart: не удалось получить значения полос Боллинджера, err=",
+               GetLastError());
+         g_last_bollinger_error_bar = error_bar;
+        }
+      return;
+     }
+
+   datetime time_start = g_rates[total - 1].time;
+   datetime time_end = time_start + PeriodSeconds(WORK_TF) * InpBBLineBars;
+   bool upper_drawn = g_gfx.HLineSegment("BB_UPPER", time_start, time_end, upper[0],
+                                         InpBBUpperColor, InpBBLineWidth, STYLE_SOLID);
+   bool middle_drawn = g_gfx.HLineSegment("BB_MIDDLE", time_start, time_end, middle[0],
+                                          InpBBMiddleColor, InpBBLineWidth, STYLE_SOLID);
+   bool lower_drawn = g_gfx.HLineSegment("BB_LOWER", time_start, time_end, lower[0],
+                                         InpBBLowerColor, InpBBLineWidth, STYLE_SOLID);
+   if(!upper_drawn || !middle_drawn || !lower_drawn)
+     {
+      if(g_last_bollinger_error_bar != time_start)
+        {
+         Print("ActeckSmart: не удалось нарисовать все маркеры полос Боллинджера, err=",
+               GetLastError());
+         g_last_bollinger_error_bar = time_start;
+        }
+      return;
+     }
+   g_bollinger_drawn = true;
+   g_last_bollinger_error_bar = 0;
+  }
 
 //+------------------------------------------------------------------+
 //| Цвет RSI по порогам Sniper                                       |
@@ -1490,6 +1573,8 @@ void RecalculateAll(void)
          return;
      }
 
+   g_m15_closed_count = total;
+   g_bollinger_drawn = false;
    // Синхронный wipe всех AS_* (включая старый RSI canvas)
    g_gfx.DeleteAll(true);
    RecreateRSICanvas();
@@ -1505,6 +1590,7 @@ void RecalculateAll(void)
    g_zz1.Draw(g_gfx, now_broker);
    g_kz.Draw(g_gfx, g_rates, total, now_broker);
    g_cont.Draw(g_gfx, g_rates, total, now_broker);
+   DrawBollingerLevels(total);
 
    UpdateRSIHud();
    ChartRedraw(0);
@@ -1548,6 +1634,8 @@ int OnInit()
    g_kz.SetZigZag(GetPointer(g_zz1));
    g_cont.SetKZ(GetPointer(g_kz));
 
+   if(!InitBollingerLevels())
+      return INIT_FAILED;
    if(!InitRSIHud())
       Print("ActeckSmart: RSI HUD отключён из-за ошибки инициализации");
 
@@ -1570,6 +1658,11 @@ void OnDeinit(const int reason)
      {
       IndicatorRelease(g_rsi_handle);
       g_rsi_handle = INVALID_HANDLE;
+     }
+   if(g_bollinger_handle != INVALID_HANDLE)
+     {
+      IndicatorRelease(g_bollinger_handle);
+      g_bollinger_handle = INVALID_HANDLE;
      }
 
    // 2) Синхронный wipe — ObjectDelete в цикле в OnDeinit НЕ успевает
@@ -1607,6 +1700,7 @@ int OnCalculate(const int rates_total,
    if(prev_calculated == 0)
      {
       RecalculateAll();
+      DrawBollingerLevels(g_m15_closed_count);
       g_last_m15_bar = iTime(_Symbol, WORK_TF, 0);
       g_allow_cont_alerts = true;
       return rates_total;
@@ -1618,6 +1712,8 @@ int OnCalculate(const int rates_total,
       g_last_m15_bar = t0;
       RecalculateAll();
      }
+   if(InpShowBollingerLevels && !g_bollinger_drawn)
+      DrawBollingerLevels(g_m15_closed_count);
    return rates_total;
   }
 
