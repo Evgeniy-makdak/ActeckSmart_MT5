@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.14"
-#property description "ActeckSmart v1.14 — КЗ, модели расширения и сигналы входа"
+#property version   "1.15"
+#property description "ActeckSmart v1.15 — КЗ, модели расширения и сигналы входа"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.14"
+#define AS_VERSION   "1.15"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -411,6 +411,16 @@ int TimeStringToMinutes(const string hhmm)
    if(n < 2)
       return 0;
    return (int)StringToInteger(parts[0]) * 60 + (int)StringToInteger(parts[1]);
+  }
+
+string FormatDateTimeISO(const datetime value)
+  {
+   MqlDateTime parts;
+   if(!TimeToStruct(value, parts))
+      return "";
+   return StringFormat("%04d-%02d-%02d %02d:%02d:%02d",
+                       parts.year, parts.mon, parts.day,
+                       parts.hour, parts.min, parts.sec);
   }
 
 datetime BrokerToGMT(const datetime broker_time)
@@ -1617,8 +1627,11 @@ public:
 
       if(InpZoneShowStateLabel)
         {
-         string state = (st == ZONE_FRESH) ? "НЕ ТРОНУТА | 38.2%"
-                        : ((st == ZONE_TOUCHED) ? "КАСАНИЕ | 38.2%" : "ПРОБИТА | 38.2%");
+         string state = (st == ZONE_FRESH) ? "НЕ ТРОНУТА"
+                        : ((st == ZONE_TOUCHED) ? "КАСАНИЕ" : "ПРОБИТА");
+         string spd_period = "(от " + FormatDateTimeISO(c.time_start) +
+                            " до " + FormatDateTimeISO(c.time_end) + ")";
+         state += " | СПД " + spd_period;
          datetime label_time = zt2 - PeriodSeconds(WORK_TF) * 4;
          double label_price = (z_lo + z_hi) * 0.5;
          color label_color = (c.direction == DIR_UP) ? C'35,90,115' : C'125,65,75';
