@@ -5,16 +5,16 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.3"
-#property description "ActeckSmart v1.3 — зоны по ликвидности, RSI HUD"
+#property version   "1.8"
+#property description "ActeckSmart v1.8 — подтверждённые КЗ и расчёт СПД без заглядывания вперёд"
 #property indicator_chart_window
 #property indicator_buffers 1
 #property indicator_plots   1
 #property indicator_type1   DRAW_NONE
 #property indicator_label1  "ActeckSmart"
 
-// Версия индикатора: повышать при каждом коммите (сейчас 1.3 — минор)
-#define AS_VERSION   "1.3"
+// Версия индикатора
+#define AS_VERSION   "1.8"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -61,9 +61,9 @@ input color  InpColorAsia            = clrDarkGreen;   // Asia
 input color  InpColorAustralia       = clrDodgerBlue;  // Australia
 
 input string InpSep5                 = "======== ВРЕМЯ СЕССИЙ (GMT) ========"; // —
-input string InpSesAustraliaStart    = "22:00";   // Australia начало GMT
+input string InpSesAustraliaStart    = "21:00";   // Australia начало GMT
 input string InpSesAustraliaEnd      = "07:00";   // Australia конец GMT
-input string InpSesAsiaStart         = "23:00";   // Asia начало GMT
+input string InpSesAsiaStart         = "21:00";   // Asia начало GMT (без дыры 21–23)
 input string InpSesAsiaEnd           = "08:00";   // Asia конец GMT
 input string InpSesEuropeStart       = "07:00";   // Europe начало GMT
 input string InpSesEuropeEnd         = "16:00";   // Europe конец GMT
@@ -90,22 +90,21 @@ input string InpSep7                 = "======== ЗОНЫ ИНТЕРЕСОВ (Fi
 input bool   InpShowInterestZones    = true;      // Показывать зоны покупателей/продавцов
 input color  InpBuyZoneColor         = C'173,216,230'; // Зона покупателей (нежно-голубой)
 input color  InpSellZoneColor        = C'255,182,193'; // Зона продавцов (нежно-розовый)
-input int    InpZoneAlpha            = 70;        // Прозрачность НЕДОСТИГНУТОЙ зоны (0-255)
-input int    InpZoneTouchedAlpha     = 45;        // Прозрачность ЗАТРОНУТОЙ (не пробитой) зоны
+input int    InpZoneAlpha            = 70;        // Непрозрачность НЕДОСТИГНУТОЙ зоны (0-255)
+input int    InpZoneTouchedAlpha     = 45;        // Непрозрачность ЗАТРОНУТОЙ (не пробитой) зоны
 input bool   InpZoneHideBroken       = true;      // Не рисовать зоны, пробитые ценой (ликвидность снята)
-input bool   InpZoneHatchTouched     = true;      // Штриховать затронутые, но не пробитые зоны
-input int    InpZoneHatchLines       = 6;         // Число линий штриховки
+input bool   InpZoneShowStateLabel   = true;      // Показывать метку состояния зоны
 input double InpFibLevel             = 0.382;     // Уровень Фибоначчи зоны интересов
 
 input string InpSepRSI               = "======== RSI HUD (как Sniper) ========"; // —
 input bool   InpShowRSI              = true;      // Показывать RSI в правом верхнем углу
 input int    InpRSIPeriod            = 14;        // Период RSI
 input bool   InpRSIUseM15            = false;     // RSI на M15 (false = ТФ графика)
-input int    InpRSISparkBars         = 48;        // Баров в мини-графике RSI
-input int    InpRSIPanelWidth        = 118;       // Ширина панели RSI (px)
-input int    InpRSIPanelHeight       = 30;        // Высота панели RSI (px)
-input int    InpRSISparkWidth        = 70;        // Ширина мини-графика внутри панели (px)
-input int    InpRSIFontSize          = 16;        // Размер шрифта числа RSI
+input int    InpRSISparkBars         = 56;        // Баров в мини-графике RSI
+input int    InpRSIPanelWidth        = 168;       // Ширина панели RSI (px)
+input int    InpRSIPanelHeight       = 48;        // Высота панели RSI (px)
+input int    InpRSISparkWidth        = 108;       // Ширина мини-графика внутри панели (px)
+input int    InpRSIFontSize          = 26;        // Размер шрифта числа RSI
 input color  InpRSIColorMid          = C'34,139,34';   // Зелёный (35..65)
 input color  InpRSIColorWarn         = C'184,134,11';  // Тёмно-золотой (читаем на белом)
 input color  InpRSIColorExt          = C'178,34,34';   // Красный (<30, >70)
@@ -147,7 +146,7 @@ enum ENUM_ZONE_STATE
   {
    ZONE_FRESH = 0,   // цена ещё не заходила — ликвидность цела
    ZONE_TOUCHED,     // зашла, но не пробила — частично снята
-   ZONE_BROKEN       // пробила закрытием — ликвидность собрана
+   ZONE_BROKEN       // тень прошла дальнюю границу — ликвидность собрана
   };
 
 //+------------------------------------------------------------------+
@@ -164,6 +163,7 @@ struct SZigPoint
 struct SKZ
   {
    datetime time_start;
+   datetime time_confirm; // Бар, на котором КЗ стала известна алгоритму
    datetime time_end;     // обрыв при пересечении (0 = ещё актуален вправо)
    double   price;
    ENUM_SESSION session;
@@ -172,7 +172,7 @@ struct SKZ
    int      zz_index;     // индекс точки зигзага 1
    bool     active;       // входит в актуальный диапазон баланса
    ENUM_DIR origin_l2;    // направление тенденции 2-го уровня, породившей КЗ
-   int      balance_id;   // номер диапазона баланса (поколение)
+   int      balance_id;   // возрастающий ID зоны
   };
 
 struct SContinued
@@ -184,7 +184,7 @@ struct SContinued
    double   unbroken_kz;      // непробитая КЗ (для Fib)
    double   broken_kz;        // пробитая КЗ
    ENUM_DIR direction;        // UP = пробой вверх
-   bool     closed;           // завершена встречным ИКИ/КЗ
+   bool     closed;           // завершена встречной КЗ
    bool     obsolete;         // вытеснена более новым ПД (линии скрыть)
    int      start_bar;
    int      end_bar;
@@ -193,6 +193,9 @@ struct SContinued
    int      idx_unbroken;     // индекс непробитой КЗ
    double   size_points;      // размер движения в пунктах (подпись курсора)
   };
+
+bool     g_allow_cont_alerts = false;
+datetime g_last_cont_alert_time = 0;
 
 //+------------------------------------------------------------------+
 //| Вспомогательные функции времени и сессий                         |
@@ -231,7 +234,20 @@ bool IsInSessionRange(const int minutes, const string start_s, const string end_
    return (minutes >= start_m && minutes < end_m);
   }
 
+// Расстояние в минутах до ближайшего края интервала [start,end) (через полночь учтён)
+int MinutesToSession(const int minutes, const string start_s, const string end_s)
+  {
+   if(IsInSessionRange(minutes, start_s, end_s))
+      return 0;
+   int start_m = TimeStringToMinutes(start_s);
+   int end_m   = TimeStringToMinutes(end_s);
+   int d_start = MathMin(MathAbs(minutes - start_m), 1440 - MathAbs(minutes - start_m));
+   int d_end   = MathMin(MathAbs(minutes - end_m),   1440 - MathAbs(minutes - end_m));
+   return MathMin(d_start, d_end);
+  }
+
 // Приоритет при наложении: NY > London > Europe > Asia > Australia
+// Asia перекрывает Australia в 21–08 GMT — как у Sniper (ночные КЗ = Asia, не N/A)
 ENUM_SESSION DetectSession(const datetime broker_time)
   {
    int m = MinutesOfDayGMT(broker_time);
@@ -245,7 +261,20 @@ ENUM_SESSION DetectSession(const datetime broker_time)
       return SES_ASIA;
    if(IsInSessionRange(m, InpSesAustraliaStart, InpSesAustraliaEnd))
       return SES_AUSTRALIA;
-   return SES_NONE;
+
+   // Fallback: ближайшая сессия (не оставляем «КЗ N/A»)
+   ENUM_SESSION best = SES_ASIA;
+   int best_d = MinutesToSession(m, InpSesAsiaStart, InpSesAsiaEnd);
+   int d;
+   d = MinutesToSession(m, InpSesAustraliaStart, InpSesAustraliaEnd);
+   if(d < best_d) { best_d = d; best = SES_AUSTRALIA; }
+   d = MinutesToSession(m, InpSesEuropeStart, InpSesEuropeEnd);
+   if(d < best_d) { best_d = d; best = SES_EUROPE; }
+   d = MinutesToSession(m, InpSesLondonStart, InpSesLondonEnd);
+   if(d < best_d) { best_d = d; best = SES_LONDON; }
+   d = MinutesToSession(m, InpSesNYStart, InpSesNYEnd);
+   if(d < best_d) { best = SES_NEWYORK; }
+   return best;
   }
 
 string SessionName(const ENUM_SESSION s)
@@ -329,20 +358,15 @@ public:
       m_prefix = prefix;
      }
 
-   // include_hud=false при пересчёте (RSI не мигает);
-   // include_hud=true при удалении индикатора — стереть всё с префиксом
+   // Синхронное удаление по префиксу (ObjectDelete в цикле — async и в OnDeinit
+   // часто не успевает → разметка остаётся на графике).
+   // include_hud оставлен для совместимости вызовов; всегда сносится весь префикс.
    void DeleteAll(const bool include_hud = false)
      {
-      int total = ObjectsTotal(m_chart, -1, -1);
-      for(int i = total - 1; i >= 0; i--)
-        {
-         string nm = ObjectName(m_chart, i, -1, -1);
-         if(StringFind(nm, m_prefix) != 0)
-            continue;
-         if(!include_hud && StringFind(nm, AS_RSI_CANVAS) >= 0)
-            continue;
-         ObjectDelete(m_chart, nm);
-        }
+      long cid = (m_chart != 0) ? m_chart : ChartID();
+      ObjectsDeleteAll(0, m_prefix, -1, -1);
+      if(cid != 0)
+         ObjectsDeleteAll(cid, m_prefix, -1, -1);
      }
 
    bool Trend(const string name, datetime t1, double p1, datetime t2, double p2,
@@ -396,34 +420,6 @@ public:
       ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 0, p1);
       ObjectSetInteger(m_chart, full, OBJPROP_TIME, 1, t2);
       ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 1, p2);
-      return true;
-     }
-
-   // Диагональная штриховка внутри прямоугольника (затронутая зона)
-   bool HatchZone(const string base, datetime t1, double p1, datetime t2, double p2,
-                  const color clr, const int count)
-     {
-      double lo = MathMin(p1, p2);
-      double hi = MathMax(p1, p2);
-      long   span = (long)(t2 - t1);
-      if(count <= 0 || span <= 0 || hi - lo < _Point)
-         return false;
-
-      for(int k = 0; k < count; k++)
-        {
-         double f  = (k + 0.5) / count;
-         // параллельные диагонали слева-снизу → справа-вверх
-         datetime ta = t1 + (datetime)(long)(span * f * 0.35);
-         datetime tb = t2 - (datetime)(long)(span * (1.0 - f) * 0.15);
-         if(tb <= ta)
-            tb = t2;
-         double pa = lo + (hi - lo) * (f * 0.15);
-         double pb = hi - (hi - lo) * ((1.0 - f) * 0.15);
-         string nm = base + IntegerToString(k);
-         if(!Trend(nm, ta, pa, tb, pb, clr, 1, STYLE_DOT, false))
-            continue;
-         ObjectSetInteger(m_chart, m_prefix + nm, OBJPROP_BACK, true);
-        }
       return true;
      }
 
@@ -553,10 +549,11 @@ public:
            {
             if(IsExternal(rates, i, i + 1))
               {
-               // i считается внутренним, ориентируемся на i+1 относительно ref... 
+               // Первый внешний игнорируется; второй становится базовым.
                // по ТЗ: n+9 игнорируется, сравниваем n+11 с n+10
-               // Здесь: пропускаем i, ref остаётся, берём i+1 как кандидата
-               i++;
+               // n+10 становится новой базовой свечой, n+11 сравнивается с ней.
+               ref = i + 1;
+               i += 2;
                continue;
               }
 
@@ -678,23 +675,20 @@ private:
       m_zz2[n] = p;
      }
 
-   void AddKZ(const SZigPoint &p, const ENUM_DIR origin_l2, const int balance_id)
+   void AddKZ(const SZigPoint &p, const datetime confirmed_at,
+              const ENUM_DIR origin_l2)
      {
-      // Не дублируем КЗ на той же цене/баре
+      // Не дублируем одну и ту же точку зигзага; близкие отдельные КЗ сохраняем.
       int n = ArraySize(m_kz);
       for(int j = 0; j < n; j++)
         {
-         if(m_kz[j].zz_index == p.bar && MathAbs(m_kz[j].price - p.price) < _Point)
-            return;
-         // Не ставим почти ту же цену повторно в том же направлении L2
-         if(m_kz[j].origin_l2 == origin_l2 &&
-            m_kz[j].is_high == (p.type == EXT_HIGH) &&
-            MathAbs(m_kz[j].price - p.price) < 5 * _Point)
+         if(m_kz[j].zz_index == p.bar && m_kz[j].is_high == (p.type == EXT_HIGH))
             return;
         }
 
       ArrayResize(m_kz, n + 1);
       m_kz[n].time_start = p.time;
+      m_kz[n].time_confirm = confirmed_at;
       m_kz[n].time_end   = 0;
       m_kz[n].price      = p.price;
       m_kz[n].session    = DetectSession(p.time);
@@ -703,7 +697,7 @@ private:
       m_kz[n].zz_index   = p.bar;
       m_kz[n].active     = true;
       m_kz[n].origin_l2  = origin_l2;
-      m_kz[n].balance_id = balance_id;
+      m_kz[n].balance_id = n;
      }
 
 public:
@@ -733,11 +727,7 @@ public:
          m_kz[i].time_end = t;
      }
 
-   // Построение тенденций 2-го уровня и КЗ по правилам ИКИ (из PDF):
-   // — действительное ИКИ только если второй импульс обновляет первый;
-   // — если зона есть и цена идёт по тренду, новая КЗ — только при ИКИ
-   //   в ОБРАТНОМ направлении (не плодим вложенные КЗ на импульсе);
-   // — альтернатива: пробитие ближайшей КЗ → крайняя точка действительного отката.
+   // Построение тенденций 2-го уровня и КЗ по правилам ИКИ (из PDF)
    void Build(const MqlRates &rates[], const int total)
      {
       Clear();
@@ -746,7 +736,6 @@ public:
 
       int n = m_zz1.Size();
       ENUM_DIR l2_dir = DIR_NONE;
-      int balance_id = 0;
 
       for(int i = 3; i < n; i++)
         {
@@ -755,44 +744,36 @@ public:
          SZigPoint p2 = m_zz1.At(i - 1);
          SZigPoint p3 = m_zz1.At(i);
 
-         // === ИКИ ВВЕРХ: Low → High → Low(выше) → High(выше первого High) ===
-         // Второй импульс ОБЯЗАН обновить первый (PDF: действительное ИКИ)
          if(p0.type == EXT_LOW && p1.type == EXT_HIGH &&
             p2.type == EXT_LOW && p3.type == EXT_HIGH &&
             p2.price > p0.price && p3.price > p1.price)
            {
             AddZZ2(p1);
             AddZZ2(p3);
-
             if(l2_dir != DIR_UP)
               {
-               // Новая КЗ только при старте / смене направления ИКИ
-               if(l2_dir == DIR_DOWN)
-                  balance_id++;
-               AddKZ(p0, DIR_UP, balance_id);
+               // КЗ создаётся по подтверждённой обратной ИКИ.
+               // Не требуем повторной проверки уже пройденного уровня:
+               // пробой мог произойти до подтверждения второго импульса.
+               AddKZ(p0, p3.time, DIR_UP);
                l2_dir = DIR_UP;
               }
            }
 
-         // === ИКИ ВНИЗ: High → Low → High(ниже) → Low(ниже первого Low) ===
          if(p0.type == EXT_HIGH && p1.type == EXT_LOW &&
             p2.type == EXT_HIGH && p3.type == EXT_LOW &&
             p2.price < p0.price && p3.price < p1.price)
            {
             AddZZ2(p1);
             AddZZ2(p3);
-
             if(l2_dir != DIR_DOWN)
               {
-               if(l2_dir == DIR_UP)
-                  balance_id++;
-               AddKZ(p0, DIR_DOWN, balance_id);
+               AddKZ(p0, p3.time, DIR_DOWN);
                l2_dir = DIR_DOWN;
               }
            }
         }
 
-      // Обрыв КЗ при пересечении свечой M15
       UpdateCrossings(rates, total);
      }
 
@@ -817,8 +798,7 @@ public:
         }
      }
 
-   // Актуальный диапазон баланса к моменту времени t (или последний, если t=0)
-   // Берём пару high/low с максимальным общим balance_id, time_start <= t
+   // Диапазон образуют последние подтверждённые верхняя и нижняя КЗ.
    bool GetBalanceRangeAt(const datetime t, double &high_kz, double &low_kz,
                           int &idx_high, int &idx_low, int &balance_id)
      {
@@ -831,67 +811,34 @@ public:
       if(n < 1)
          return false;
 
-      // Находим максимальный balance_id среди КЗ, уже сформированных к моменту t
-      int max_bal = -1;
+      datetime high_confirm = 0;
+      datetime low_confirm  = 0;
       for(int i = 0; i < n; i++)
         {
-         if(t != 0 && m_kz[i].time_start > t)
+         if(t != 0 && m_kz[i].time_confirm > t)
             continue;
-         if(m_kz[i].balance_id > max_bal)
-            max_bal = m_kz[i].balance_id;
-        }
-      if(max_bal < 0)
-         return false;
-
-      // Внутри этого поколения ищем последнюю high и последнюю low КЗ
-      // Также допускаем соседнее поколение, если в max_bal только один тип
-      for(int i = n - 1; i >= 0; i--)
-        {
-         if(t != 0 && m_kz[i].time_start > t)
-            continue;
-         if(m_kz[i].balance_id != max_bal && m_kz[i].balance_id != max_bal - 1)
-            continue;
-         if(m_kz[i].is_high && idx_high < 0)
+         if(m_kz[i].is_high &&
+            (idx_high < 0 || m_kz[i].time_confirm >= high_confirm))
            {
             idx_high = i;
-            high_kz  = m_kz[i].price;
+            high_kz = m_kz[i].price;
+            high_confirm = m_kz[i].time_confirm;
            }
-         if(!m_kz[i].is_high && idx_low < 0)
+         if(!m_kz[i].is_high &&
+            (idx_low < 0 || m_kz[i].time_confirm >= low_confirm))
            {
             idx_low = i;
             low_kz  = m_kz[i].price;
-           }
-         if(idx_high >= 0 && idx_low >= 0)
-            break;
-        }
-
-      // Fallback: любые две последние разных типов
-      if(idx_high < 0 || idx_low < 0)
-        {
-         idx_high = -1;
-         idx_low  = -1;
-         for(int i = n - 1; i >= 0; i--)
-           {
-            if(t != 0 && m_kz[i].time_start > t)
-               continue;
-            if(m_kz[i].is_high && idx_high < 0)
-              {
-               idx_high = i;
-               high_kz  = m_kz[i].price;
-              }
-            if(!m_kz[i].is_high && idx_low < 0)
-              {
-               idx_low = i;
-               low_kz  = m_kz[i].price;
-              }
-            if(idx_high >= 0 && idx_low >= 0)
-               break;
+            low_confirm = m_kz[i].time_confirm;
            }
         }
 
       if(idx_high < 0 || idx_low < 0 || high_kz <= low_kz)
          return false;
-      balance_id = max_bal;
+      // У каждой зоны уникальный возрастающий ID; максимум пары меняется
+      // при появлении новой границы диапазона.
+      balance_id = (m_kz[idx_high].balance_id > m_kz[idx_low].balance_id)
+                   ? m_kz[idx_high].balance_id : m_kz[idx_low].balance_id;
       return true;
      }
 
@@ -901,19 +848,18 @@ public:
       return GetBalanceRangeAt(0, high_kz, low_kz, idx_high, idx_low, bal);
      }
 
-   // Есть ли КЗ встречного L2 после момента t_from (для закрытия ПД)
+   // Встречная КЗ, подтверждённая после начала ПД.
    bool FindOpposingKZ(const datetime t_from, const datetime t_to,
-                       const ENUM_DIR cm_dir, int &idx_out)
+                       const ENUM_DIR cm_dir, int &idx_out) const
      {
       idx_out = -1;
-      // Для ПД вниз нужна КЗ от восходящей L2; для ПД вверх — от нисходящей L2
       ENUM_DIR need = (cm_dir == DIR_DOWN) ? DIR_UP : DIR_DOWN;
       int n = ArraySize(m_kz);
       for(int k = 0; k < n; k++)
         {
-         if(m_kz[k].time_start <= t_from)
+         if(m_kz[k].time_confirm <= t_from)
             continue;
-         if(t_to != 0 && m_kz[k].time_start > t_to)
+         if(t_to != 0 && m_kz[k].time_confirm > t_to)
             continue;
          if(m_kz[k].origin_l2 == need)
            {
@@ -949,14 +895,28 @@ public:
       double point_off = InpKZLabelOffsetPoints * _Point;
 
       int kz_n = ArraySize(m_kz);
+      int current_high = -1, current_low = -1;
+      double current_high_price, current_low_price;
+      bool has_balance = GetBalanceRange(current_high_price, current_low_price,
+                                         current_high, current_low);
+      int latest_kz = -1;
+      if(!has_balance)
+        {
+         for(int k = 0; k < kz_n; k++)
+            if(latest_kz < 0 ||
+               m_kz[k].time_confirm > m_kz[latest_kz].time_confirm)
+               latest_kz = k;
+        }
+
       for(int k = 0; k < kz_n; k++)
         {
-         if(ShouldDeleteByAge(m_kz[k].time_start, now_broker))
+         bool current = (k == current_high || k == current_low || k == latest_kz);
+         if(!current && ShouldDeleteByAge(m_kz[k].time_confirm, now_broker))
             continue;
 
          datetime t2 = (m_kz[k].time_end != 0) ? m_kz[k].time_end : last_time;
          color base = SessionColor(m_kz[k].session);
-         color clr  = ApplyFade(base, m_kz[k].time_start, now_broker);
+         color clr  = current ? base : ApplyFade(base, m_kz[k].time_confirm, now_broker);
          int width  = m_kz[k].broken ? InpKZBrokenWidth : InpKZWidth;
          ENUM_LINE_STYLE style = m_kz[k].broken ? STYLE_SOLID : InpKZStyle;
 
@@ -1029,11 +989,7 @@ public:
       if(m_kz == NULL || total < 5)
          return;
 
-      // Правила (PDF ИКИ + образец Sniper):
-      // 1) ПД стартует ТОЛЬКО от пробоя актуального диапазона баланса.
-      // 2) Пока ПД активно — одна структура; чужие/старые КЗ игнорируются.
-      // 3) Закрытие — только КЗ от ИКИ ВСТРЕЧНОГО направления.
-      // 4) Новое ПД вытесняет линии предыдущего (obsolete), курсор остаётся по настройкам.
+      // Пробой закрытием диапазона → экстремумы → подтверждение встречной КЗ
 
       bool in_move = false;
       SContinued cur;
@@ -1042,7 +998,7 @@ public:
       double high_kz = 0, low_kz = 0;
       int idx_h = -1, idx_l = -1, bal_id = -1;
       datetime armed_after = 0;
-      int locked_bal = -1; // баланс, из которого идёт текущее ПД
+      int locked_bal = -1;
 
       for(int i = 0; i < total; i++)
         {
@@ -1053,13 +1009,13 @@ public:
 
             SKZ kz_h = m_kz.KZAt(idx_h);
             SKZ kz_l = m_kz.KZAt(idx_l);
-            datetime range_start = (kz_h.time_start > kz_l.time_start) ? kz_h.time_start : kz_l.time_start;
+            datetime range_start = (kz_h.time_confirm > kz_l.time_confirm)
+                                   ? kz_h.time_confirm : kz_l.time_confirm;
 
             if(rates[i].time <= range_start)
                continue;
             if(armed_after != 0 && rates[i].time <= armed_after)
                continue;
-            // Не перезапускаем ПД из того же уже отработанного баланса
             if(bal_id == locked_bal)
                continue;
 
@@ -1083,8 +1039,12 @@ public:
                cur.idx_unbroken = idx_l;
                locked_bal       = bal_id;
                m_kz.SetKZBroken(idx_h, true);
-               if(InpContAlert)
+               if(InpContAlert && g_allow_cont_alerts &&
+                  i == total - 1 && g_last_cont_alert_time != rates[i].time)
+                 {
                   Alert("ActeckSmart: продолженное движение ВВЕРХ на ", _Symbol);
+                  g_last_cont_alert_time = rates[i].time;
+                 }
               }
             else if(rates[i].close < low_kz)
               {
@@ -1106,13 +1066,16 @@ public:
                cur.idx_unbroken = idx_h;
                locked_bal       = bal_id;
                m_kz.SetKZBroken(idx_l, true);
-               if(InpContAlert)
+               if(InpContAlert && g_allow_cont_alerts &&
+                  i == total - 1 && g_last_cont_alert_time != rates[i].time)
+                 {
                   Alert("ActeckSmart: продолженное движение ВНИЗ на ", _Symbol);
+                  g_last_cont_alert_time = rates[i].time;
+                 }
               }
            }
          else
            {
-            // Продление одной наклонной на новые экстремумы
             if(cur.direction == DIR_UP)
               {
                if(rates[i].high > cur.price_end)
@@ -1132,17 +1095,16 @@ public:
                  }
               }
 
-            // Закрытие только встречным ИКИ (origin_l2 противоположный)
             int opp = -1;
             if(m_kz.FindOpposingKZ(cur.time_start, rates[i].time, cur.direction, opp))
               {
                SKZ z = m_kz.KZAt(opp);
                cur.closed   = true;
-               cur.time_end = z.time_start;
+               cur.time_end = z.time_confirm;
                FinalizeItem(cur, rates, total);
                in_move = false;
-               armed_after = z.time_start;
-               locked_bal = -1; // новый диапазон сможет стартовать новое ПД
+               armed_after = z.time_confirm;
+               locked_bal = -1;
                ZeroMemory(cur);
               }
            }
@@ -1213,18 +1175,22 @@ public:
 
       color zclr = (c.direction == DIR_UP) ? InpBuyZoneColor : InpSellZoneColor;
       zclr = ApplyFade(zclr, c.time_start, now_broker);
-      int za = (st == ZONE_TOUCHED) ? InpZoneTouchedAlpha : InpZoneAlpha;
+      int za = (st == ZONE_FRESH) ? InpZoneAlpha : InpZoneTouchedAlpha;
 
       string zname = "CM_Z_" + IntegerToString(idx);
       gfx.Rectangle(zname, c.time_start, z_lo, zt2, z_hi, zclr, za);
 
-      // Затронутые, но не пробитые — диагональная штриховка (отличие от FRESH)
-      if(st == ZONE_TOUCHED && InpZoneHatchTouched)
+      if(InpZoneShowStateLabel)
         {
-         color hclr = (c.direction == DIR_UP) ? C'70,130,180' : C'180,80,100';
-         hclr = ApplyFade(hclr, c.time_start, now_broker);
-         gfx.HatchZone("CM_ZH" + IntegerToString(idx) + "_",
-                       c.time_start, z_lo, zt2, z_hi, hclr, InpZoneHatchLines);
+         string state = (st == ZONE_FRESH) ? "НЕ ТРОНУТА | 38.2%"
+                        : ((st == ZONE_TOUCHED) ? "КАСАНИЕ | 38.2%" : "ПРОБИТА | 38.2%");
+         datetime label_time = zt2 - PeriodSeconds(WORK_TF) * 4;
+         double label_price = (z_lo + z_hi) * 0.5;
+         color label_color = (c.direction == DIR_UP) ? C'35,90,115' : C'125,65,75';
+         label_color = ApplyFade(label_color, c.time_start, now_broker);
+         gfx.TextLabel("CM_ZS_" + IntegerToString(idx),
+                       label_time, label_price, state,
+                       label_color, InpKZFont, InpKZFontSize, ANCHOR_RIGHT);
         }
      }
 
@@ -1234,7 +1200,8 @@ public:
          return;
 
       int n = ArraySize(m_items);
-      // Режим Sniper: не выкидываем историю. Режим v1.1: скрываем obsolete / лимит.
+      // В режиме истории сохраняем линии СПД, как на контрольном графике Sniper.
+      // Ограничение/скрытие старых линий доступно только в режиме v1.1.
       const bool sniper_hist = InpSniperStyleHistory;
       int first_lines = 0;
       if(!sniper_hist && InpMaxVisibleCM > 0)
@@ -1246,12 +1213,11 @@ public:
          if(ShouldDeleteByAge(c.time_start, now_broker))
             continue;
 
-         // Sniper: линии старого ПД прячем, но зону Fib и курсор оставляем (франк).
-         // v1.1: InpHideObsoleteCM + лимит MaxVisibleCM.
-         const bool hide_lines = sniper_hist
-                                ? c.obsolete
-                                : ((InpHideObsoleteCM && c.obsolete) || (i < first_lines));
-         // Зону показываем и у obsolete (Sniper), если не пробита (см. DrawZone)
+         // Sniper сохраняет исторические пунктиры. В режиме v1.1 ими управляют
+         // флаг скрытия устаревших СПД и ограничение числа отображаемых линий.
+         const bool hide_lines = !sniper_hist &&
+                                 ((InpHideObsoleteCM && c.obsolete) || (i < first_lines));
+         // Зона показывается для исторических СПД согласно настройке.
          const bool show_zone = InpShowInterestZones &&
                                 (sniper_hist ? (InpKeepObsoleteZones || !c.obsolete)
                                              : !c.obsolete);
@@ -1260,7 +1226,11 @@ public:
 
          datetime t_end_pt = (c.end_bar >= 0 && c.end_bar < total) ? rates[c.end_bar].time
                             : ((c.time_end != 0) ? c.time_end : rates[total - 1].time);
-         datetime t_h_end  = t_end_pt + PeriodSeconds(WORK_TF);
+         datetime chart_end = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
+         datetime t_h_end  = c.closed ? c.time_end
+                                      : rates[total - 1].time + PeriodSeconds(WORK_TF);
+         if(t_h_end <= c.time_start)
+            t_h_end = c.time_start + PeriodSeconds(WORK_TF);
          datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
          if(zt2 < t_h_end)
             zt2 = t_h_end;
@@ -1272,21 +1242,17 @@ public:
                              c.time_start, t_h_end, c.price_break,
                              clr, InpContWidth, InpContStyle);
 
-            // Наклонная: от экстремума бара пробоя до текущего экстремума ПД
-            double p_start_ext = c.price_break;
-            if(c.start_bar >= 0 && c.start_bar < total)
-               p_start_ext = (c.direction == DIR_UP) ? rates[c.start_bar].high
-                                                     : rates[c.start_bar].low;
-
+            // Наклонная начинается точно на уровне пробитой границы баланса.
+            // Экстремум свечи пробоя — это уже часть движения, а не его точка старта.
             gfx.Trend("CM_D_" + IntegerToString(i),
-                      c.time_start, p_start_ext,
+                      c.time_start, c.price_break,
                       t_end_pt, c.price_end,
                       clr, InpContWidth, InpContStyle);
 
             if(c.closed)
               {
                gfx.HLineSegment("CM_H1_" + IntegerToString(i),
-                                c.time_end, t_h_end + PeriodSeconds(WORK_TF) * 4, c.price_end,
+                                t_end_pt, chart_end, c.price_end,
                                 clr, InpContWidth, InpContStyle);
               }
            }
@@ -1337,8 +1303,41 @@ color RSIValueColor(const double rsi)
   }
 
 //+------------------------------------------------------------------+
-//| Инициализация / уничтожение RSI HUD                              |
+//| RSI canvas / init / deinit                                       |
 //+------------------------------------------------------------------+
+// Пересоздать bitmap-панель RSI (после ObjectsDeleteAll объект исчезает)
+bool RecreateRSICanvas(void)
+  {
+   if(!InpShowRSI)
+      return true;
+
+   if(g_rsi_canvas_ok)
+     {
+      g_rsi_canvas.Destroy();
+      g_rsi_canvas_ok = false;
+     }
+
+   string cname = InpPrefix + AS_RSI_CANVAS;
+   ObjectsDeleteAll(0, cname, -1, -1);
+
+   if(!g_rsi_canvas.CreateBitmapLabel(cname, 0, 0,
+                                      InpRSIPanelWidth, InpRSIPanelHeight,
+                                      COLOR_FORMAT_ARGB_NORMALIZE))
+     {
+      Print("ActeckSmart: Canvas RSI не создан, err=", GetLastError());
+      return false;
+     }
+   ObjectSetInteger(0, cname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, cname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+   ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 22);
+   ObjectSetInteger(0, cname, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, cname, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, cname, OBJPROP_BACK, false);
+   g_rsi_canvas_ok = true;
+   return true;
+  }
+
 bool InitRSIHud(void)
   {
    if(!InpShowRSI)
@@ -1352,29 +1351,7 @@ bool InitRSIHud(void)
       return false;
      }
 
-   // Снести артефакты старых версий (label RSI / кастомный TITLE)
-   ObjectDelete(0, InpPrefix + "RSI_LB");
-   ObjectDelete(0, InpPrefix + "TITLE");
-
-   string cname = InpPrefix + AS_RSI_CANVAS;
-   ObjectDelete(0, cname);
-   if(!g_rsi_canvas.CreateBitmapLabel(cname, 0, 0,
-                                      InpRSIPanelWidth, InpRSIPanelHeight,
-                                      COLOR_FORMAT_ARGB_NORMALIZE))
-     {
-      Print("ActeckSmart: Canvas RSI не создан, err=", GetLastError());
-      return false;
-     }
-   ObjectSetInteger(0, cname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
-   ObjectSetInteger(0, cname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
-   ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 10);
-   // Ниже системного имени индикатора (кликабельное SHORTNAME)
-   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 22);
-   ObjectSetInteger(0, cname, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, cname, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, cname, OBJPROP_BACK, false);
-   g_rsi_canvas_ok = true;
-   return true;
+   return RecreateRSICanvas();
   }
 
 void DeinitRSIHud(void)
@@ -1389,9 +1366,6 @@ void DeinitRSIHud(void)
       g_rsi_canvas.Destroy();
       g_rsi_canvas_ok = false;
      }
-   ObjectDelete(0, InpPrefix + "RSI_LB");
-   ObjectDelete(0, InpPrefix + AS_RSI_CANVAS);
-   ObjectDelete(0, InpPrefix + "TITLE");
   }
 
 //+------------------------------------------------------------------+
@@ -1516,7 +1490,9 @@ void RecalculateAll(void)
          return;
      }
 
-   g_gfx.DeleteAll();
+   // Синхронный wipe всех AS_* (включая старый RSI canvas)
+   g_gfx.DeleteAll(true);
+   RecreateRSICanvas();
 
    g_zz1.Build(g_rates, total);
    g_kz.SetZigZag(GetPointer(g_zz1));
@@ -1564,10 +1540,11 @@ int OnInit()
    IndicatorSetString(INDICATOR_SHORTNAME, AS_SHORTNAME);
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
 
-   // Убрать кастомный TITLE со старых версий — он перекрывал системное имя
-   ObjectDelete(0, InpPrefix + "TITLE");
+   g_gfx.Init(ChartID(), InpPrefix);
+   // Снести артефакты прошлой сессии / старых версий (TITLE, RSI_LB, AS_*)
+   ObjectsDeleteAll(0, InpPrefix, -1, -1);
+   ObjectsDeleteAll(ChartID(), InpPrefix, -1, -1);
 
-   g_gfx.Init(0, InpPrefix);
    g_kz.SetZigZag(GetPointer(g_zz1));
    g_cont.SetKZ(GetPointer(g_kz));
 
@@ -1583,10 +1560,29 @@ int OnInit()
 
 void OnDeinit(const int reason)
   {
-   // Сначала canvas, затем все объекты с префиксом (включая RSI/TITLE)
-   DeinitRSIHud();
-   g_gfx.DeleteAll(true);
+   // 1) Освободить CCanvas (иначе bitmap может «залипнуть»)
+   if(g_rsi_canvas_ok)
+     {
+      g_rsi_canvas.Destroy();
+      g_rsi_canvas_ok = false;
+     }
+   if(g_rsi_handle != INVALID_HANDLE)
+     {
+      IndicatorRelease(g_rsi_handle);
+      g_rsi_handle = INVALID_HANDLE;
+     }
+
+   // 2) Синхронный wipe — ObjectDelete в цикле в OnDeinit НЕ успевает
+   long cid = ChartID();
+   int n0 = ObjectsDeleteAll(0, InpPrefix, -1, -1);
+   int n1 = (cid != 0) ? ObjectsDeleteAll(cid, InpPrefix, -1, -1) : 0;
+
    ChartRedraw(0);
+   if(cid != 0)
+      ChartRedraw(cid);
+
+   PrintFormat("ActeckSmart: OnDeinit reason=%d, ObjectsDeleteAll=%d+%d, prefix=%s",
+               reason, n0, n1, InpPrefix);
   }
 
 int OnCalculate(const int rates_total,
@@ -1612,6 +1608,7 @@ int OnCalculate(const int rates_total,
      {
       RecalculateAll();
       g_last_m15_bar = iTime(_Symbol, WORK_TF, 0);
+      g_allow_cont_alerts = true;
       return rates_total;
      }
 
