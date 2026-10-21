@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.12"
+#property version   "1.13"
 #property description "Советник Safe для ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
@@ -72,19 +72,22 @@ bool IsTradeRetcodeSuccessful(void)
    return (code == TRADE_RETCODE_DONE || code == TRADE_RETCODE_DONE_PARTIAL);
   }
 
-bool ReadSignal(const datetime signal_bar, double &direction, double &stop,
-                double &tp1, double &tp2, double &model, bool &ready)
+bool ReadSignal(const datetime signal_bar, double &direction, double &entry,
+                double &stop, double &tp1, double &tp2, double &model,
+                double &spec_spread, double &spread_percent, bool &ready)
   {
    ready = false;
    double dir_value[1], stop_value[1], tp1_value[1], tp2_value[1], model_value[1];
-   double processed_time[1];
+   double processed_time[1], spread_value[1], spread_percent_value[1];
    ResetLastError();
    if(CopyBuffer(g_signal_handle, 1, 1, 1, dir_value) != 1 ||
       CopyBuffer(g_signal_handle, 2, 1, 1, stop_value) != 1 ||
       CopyBuffer(g_signal_handle, 3, 1, 1, tp1_value) != 1 ||
       CopyBuffer(g_signal_handle, 4, 1, 1, tp2_value) != 1 ||
       CopyBuffer(g_signal_handle, 5, 1, 1, model_value) != 1 ||
-      CopyBuffer(g_signal_handle, 6, 1, 1, processed_time) != 1)
+      CopyBuffer(g_signal_handle, 6, 1, 1, processed_time) != 1 ||
+      CopyBuffer(g_signal_handle, 7, 1, 1, spread_value) != 1 ||
+      CopyBuffer(g_signal_handle, 8, 1, 1, spread_percent_value) != 1)
      {
       Print("ActeckSmart Trader: не удалось прочитать буферы сигнала, err=",
             GetLastError());
@@ -95,14 +98,24 @@ bool ReadSignal(const datetime signal_bar, double &direction, double &stop,
    ready = true;
    if(dir_value[0] == EMPTY_VALUE || dir_value[0] == 0.0 ||
       stop_value[0] == EMPTY_VALUE || tp1_value[0] == EMPTY_VALUE ||
-      tp2_value[0] == EMPTY_VALUE || model_value[0] == EMPTY_VALUE)
+      tp2_value[0] == EMPTY_VALUE || model_value[0] == EMPTY_VALUE ||
+      spread_value[0] == EMPTY_VALUE ||
+      spread_percent_value[0] == EMPTY_VALUE)
       return false;
 
+   int shift = iBarShift(_Symbol, (ENUM_TIMEFRAMES)_Period, signal_bar, true);
+   if(shift < 1)
+      return false;
+   entry = iClose(_Symbol, (ENUM_TIMEFRAMES)_Period, shift);
+   if(entry <= 0.0)
+      return false;
    direction = dir_value[0];
    stop = stop_value[0];
    tp1 = tp1_value[0];
    tp2 = tp2_value[0];
    model = model_value[0];
+   spec_spread = spread_value[0];
+   spread_percent = spread_percent_value[0];
    if(signal_bar <= 0 || (direction != 1.0 && direction != -1.0))
       return false;
    return true;
@@ -268,6 +281,34 @@ bool CloseNettingPositionFully(void)
    return !PositionSelect(_Symbol);
   }
 
+bool ValidateSafeLevels(const ENUM_ORDER_TYPE order_type, const double stop,
+                        const double tp1, const double tp2)
+  {
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick) || tick.bid <= 0.0 || tick.ask <= 0.0)
+      return false;
+
+   double min_distance = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) *
+                         _Point;
+   if(order_type == ORDER_TYPE_BUY)
+      return (stop < tick.bid - min_distance &&
+              tp1 > tick.bid + min_distance &&
+              tp2 > tick.bid + min_distance);
+   return (stop > tick.ask + min_distance &&
+           tp1 < tick.ask - min_distance &&
+           tp2 < tick.ask - min_distance);
+  }
+
+double SafeLevelPrice(const ENUM_ORDER_TYPE order_type, const double entry,
+                      const double distance, const bool is_stop)
+  {
+   double price = (order_type == ORDER_TYPE_BUY)
+                  ? (is_stop ? entry - distance : entry + distance)
+                  : (is_stop ? entry + distance : entry - distance);
+   bool round_up = ((order_type == ORDER_TYPE_SELL) == is_stop);
+   return NormalizePriceToTick(price, round_up);
+  }
+
 bool PersistNettingState(void)
   {
    bool saved_tp1 = GlobalVariableSet(g_netting_state_prefix + "TP1",
@@ -402,12 +443,26 @@ void ManageNettingPosition(void)
   }
 
 bool OpenHedgingLeg(const ENUM_ORDER_TYPE order_type, const double volume,
-                    const double stop, const int target_multiple,
+                    const double stop_price, const double target_distance,
+                    const double other_target_distance,
                     ulong &position_ticket)
   {
+   double quote_entry = (order_type == ORDER_TYPE_BUY)
+                        ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                        : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double provisional_tp1 = SafeLevelPrice(order_type, quote_entry,
+                                           target_distance, false);
+   double provisional_tp2 = SafeLevelPrice(order_type, quote_entry,
+                                           other_target_distance, false);
+   if(!ValidateSafeLevels(order_type, stop_price,
+                          provisional_tp1, provisional_tp2))
+     {
+      Print("ActeckSmart Trader: уровни Safe слишком близки к рынку для ограничений брокера");
+      return false;
+     }
    bool sent = (order_type == ORDER_TYPE_BUY)
-               ? g_trade.Buy(volume, _Symbol, 0.0, stop, 0.0, "Acteck Safe")
-               : g_trade.Sell(volume, _Symbol, 0.0, stop, 0.0, "Acteck Safe");
+               ? g_trade.Buy(volume, _Symbol, 0.0, stop_price, 0.0, "Acteck Safe")
+               : g_trade.Sell(volume, _Symbol, 0.0, stop_price, 0.0, "Acteck Safe");
    if(!sent || !IsTradeRetcodeSuccessful())
      {
       Print("ActeckSmart Trader: не удалось открыть часть Safe: ",
@@ -437,11 +492,17 @@ bool OpenHedgingLeg(const ENUM_ORDER_TYPE order_type, const double volume,
       return false;
      }
 
-   double target = (order_type == ORDER_TYPE_BUY)
-                   ? fill + MathAbs(fill - stop) * target_multiple
-                   : fill - MathAbs(fill - stop) * target_multiple;
-   target = NormalizePriceToTick(target, order_type == ORDER_TYPE_BUY);
-   if(!g_trade.PositionModify(position_ticket, stop, target) ||
+   double final_tp = SafeLevelPrice(order_type, fill, target_distance, false);
+   double final_tp2 = SafeLevelPrice(order_type, fill,
+                                     other_target_distance, false);
+   if(!ValidateSafeLevels(order_type, stop_price, final_tp, final_tp2))
+     {
+      Print("ActeckSmart Trader: fill пересёк рассчитанные уровни либо нарушает min stop distance");
+      if(!CloseHedgingPositionFully(position_ticket))
+         Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть позицию с недопустимыми уровнями Safe");
+      return false;
+     }
+   if(!g_trade.PositionModify(position_ticket, stop_price, final_tp) ||
       !IsTradeRetcodeSuccessful())
      {
       Print("ActeckSmart Trader: не удалось скорректировать TP по цене исполнения: ",
@@ -455,14 +516,24 @@ bool OpenHedgingLeg(const ENUM_ORDER_TYPE order_type, const double volume,
   }
 
 bool ExecuteHedgingSafe(const ENUM_ORDER_TYPE order_type, const double volume,
-                        const double stop)
+                        const double stop_distance, const double tp1_distance,
+                        const double tp2_distance)
   {
+   double reference_entry = (order_type == ORDER_TYPE_BUY)
+                            ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                            : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double common_stop = SafeLevelPrice(order_type, reference_entry,
+                                       stop_distance, true);
    ulong first_ticket = 0;
-   if(!OpenHedgingLeg(order_type, volume, stop, 1, first_ticket))
+   if(!OpenHedgingLeg(order_type, volume, common_stop, tp1_distance,
+                      tp2_distance,
+                      first_ticket))
       return false;
 
    ulong second_ticket = 0;
-   if(!OpenHedgingLeg(order_type, volume, stop, 2, second_ticket))
+   if(!OpenHedgingLeg(order_type, volume, common_stop, tp2_distance,
+                      tp1_distance,
+                      second_ticket))
      {
       if(!CloseHedgingPositionFully(first_ticket))
          Alert("ActeckSmart Trader: КРИТИЧНО — вторая часть Safe не открыта, первую закрыть не удалось. Ticket ",
@@ -473,8 +544,22 @@ bool ExecuteHedgingSafe(const ENUM_ORDER_TYPE order_type, const double volume,
    double first_risk = 0.0, second_risk = 0.0;
    double maximum_risk = AccountInfoDouble(ACCOUNT_BALANCE) *
                          InpRiskPercent / 100.0;
-   if(!GetPositionRisk(first_ticket, stop, first_risk) ||
-      !GetPositionRisk(second_ticket, stop, second_risk) ||
+   if(!PositionSelectByTicket(first_ticket))
+     {
+      CloseHedgingPositionFully(first_ticket);
+      CloseHedgingPositionFully(second_ticket);
+      return false;
+     }
+   if(!GetPositionRisk(first_ticket, common_stop, first_risk) ||
+      !PositionSelectByTicket(second_ticket))
+     {
+      bool first_closed = CloseHedgingPositionFully(first_ticket);
+      bool second_closed = CloseHedgingPositionFully(second_ticket);
+      if(!first_closed || !second_closed)
+         Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть Safe после ошибки проверки риска");
+      return false;
+     }
+   if(!GetPositionRisk(second_ticket, common_stop, second_risk) ||
       first_risk + second_risk > maximum_risk + 0.01)
      {
       Alert("ActeckSmart Trader: фактический риск Safe после исполнения превысил лимит или не вычислен; закрываются обе части");
@@ -488,14 +573,30 @@ bool ExecuteHedgingSafe(const ENUM_ORDER_TYPE order_type, const double volume,
   }
 
 bool ExecuteNettingSafe(const ENUM_ORDER_TYPE order_type, const double volume,
-                        const double stop)
+                        const double stop_distance, const double tp1_distance,
+                        const double tp2_distance)
   {
    double total_volume = NormalizeVolumeDown(volume * 2.0);
    if(total_volume <= 0.0)
       return false;
+   double quote_entry = (order_type == ORDER_TYPE_BUY)
+                        ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                        : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double provisional_stop = SafeLevelPrice(order_type, quote_entry,
+                                            stop_distance, true);
+   double provisional_tp1 = SafeLevelPrice(order_type, quote_entry,
+                                           tp1_distance, false);
+   double provisional_tp2 = SafeLevelPrice(order_type, quote_entry,
+                                           tp2_distance, false);
+   if(!ValidateSafeLevels(order_type, provisional_stop,
+                          provisional_tp1, provisional_tp2))
+     {
+      Print("ActeckSmart Trader: уровни Safe слишком близки к рынку для ограничений брокера");
+      return false;
+     }
    bool sent = (order_type == ORDER_TYPE_BUY)
-               ? g_trade.Buy(total_volume, _Symbol, 0.0, stop, 0.0, "Acteck Safe")
-               : g_trade.Sell(total_volume, _Symbol, 0.0, stop, 0.0, "Acteck Safe");
+               ? g_trade.Buy(total_volume, _Symbol, 0.0, provisional_stop, 0.0, "Acteck Safe")
+               : g_trade.Sell(total_volume, _Symbol, 0.0, provisional_stop, 0.0, "Acteck Safe");
    if(!sent || !IsTradeRetcodeSuccessful())
      {
       Print("ActeckSmart Trader: не удалось открыть netting Safe: ",
@@ -522,23 +623,32 @@ bool ExecuteNettingSafe(const ENUM_ORDER_TYPE order_type, const double volume,
      }
 
    double fill = PositionGetDouble(POSITION_PRICE_OPEN);
-   double risk_distance = MathAbs(fill - stop);
    ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-   g_netting_tp1 = NormalizePriceToTick((type == POSITION_TYPE_BUY)
-                                        ? fill + risk_distance : fill - risk_distance,
-                                        type == POSITION_TYPE_BUY);
-   g_netting_tp2 = NormalizePriceToTick((type == POSITION_TYPE_BUY)
-                                        ? fill + risk_distance * 2.0
-                                        : fill - risk_distance * 2.0,
-                                        type == POSITION_TYPE_BUY);
+   double final_stop = SafeLevelPrice(order_type, fill, stop_distance, true);
+   g_netting_tp1 = SafeLevelPrice(order_type, fill, tp1_distance, false);
+   g_netting_tp2 = SafeLevelPrice(order_type, fill, tp2_distance, false);
    g_netting_leg_volume = volume;
    g_netting_tp1_done = false;
-   if(!g_trade.PositionModify(_Symbol, stop, g_netting_tp2) ||
+   if(!ValidateSafeLevels(order_type, final_stop, g_netting_tp1,
+                          g_netting_tp2))
+     {
+      Alert("ActeckSmart Trader: fill пересёк рассчитанные уровни либо нарушает min stop distance; позиция закрывается");
+      if(CloseNettingPositionFully())
+         ClearNettingState();
+      else
+         Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть netting-позицию с недопустимыми уровнями");
+      return false;
+     }
+   if(!g_trade.PositionModify(_Symbol, final_stop, g_netting_tp2) ||
       !IsTradeRetcodeSuccessful())
      {
       Print("ActeckSmart Trader: TP2 серверной защиты не установлен: ",
             g_trade.ResultRetcodeDescription());
-      Alert("ActeckSmart Trader: проверьте вручную netting-позицию — серверный TP2 не установлен");
+      if(CloseNettingPositionFully())
+         ClearNettingState();
+      else
+         Alert("ActeckSmart Trader: КРИТИЧНО — TP2 не установлен и netting-позицию не удалось закрыть");
+      return false;
      }
    if(!PersistNettingState())
      {
@@ -553,7 +663,7 @@ bool ExecuteNettingSafe(const ENUM_ORDER_TYPE order_type, const double volume,
    double position_risk = 0.0;
    double maximum_risk = AccountInfoDouble(ACCOUNT_BALANCE) *
                          InpRiskPercent / 100.0;
-   if(!GetPositionRisk((ulong)PositionGetInteger(POSITION_TICKET), stop,
+   if(!GetPositionRisk((ulong)PositionGetInteger(POSITION_TICKET), final_stop,
                        position_risk) ||
       position_risk > maximum_risk + 0.01)
      {
@@ -568,8 +678,10 @@ bool ExecuteNettingSafe(const ENUM_ORDER_TYPE order_type, const double volume,
    return true;
   }
 
-bool ExecuteSignal(const double direction, const double signal_stop,
-                   const double signal_tp1, const double signal_tp2)
+bool ExecuteSignal(const double direction, const double signal_entry,
+                   const double signal_stop, const double signal_tp1,
+                   const double signal_tp2, const double signal_spec_spread,
+                   const double spread_percent)
   {
    ENUM_ACCOUNT_MARGIN_MODE account_mode =
       (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
@@ -592,19 +704,35 @@ bool ExecuteSignal(const double direction, const double signal_stop,
    if(bid <= 0.0 || ask <= 0.0)
       return false;
    double entry = (order_type == ORDER_TYPE_BUY) ? ask : bid;
+   double current_spec_spread = (spread_percent > 0.0)
+                                ? entry * spread_percent : signal_spec_spread;
+   double effective_spread = MathMax(current_spec_spread, ask - bid);
+   double stop_points_distance = MathAbs(signal_entry - signal_stop) -
+                                 signal_spec_spread;
+   double tp1_points_distance = MathAbs(signal_tp1 - signal_entry) -
+                                signal_spec_spread;
+   double tp2_points_distance = MathAbs(signal_tp2 - signal_entry) -
+                                signal_spec_spread;
+   if(effective_spread <= 0.0 || stop_points_distance <= 0.0 ||
+      tp1_points_distance <= 0.0 || tp2_points_distance <= 0.0)
+     {
+      Print("ActeckSmart Trader: нельзя восстановить фиксированные дистанции SL/TP из сигнала");
+      return false;
+     }
+   double stop_distance = stop_points_distance + effective_spread;
+   double tp1_distance = tp1_points_distance + effective_spread;
+   double tp2_distance = tp2_points_distance + effective_spread;
    double sizing_entry = entry + ((order_type == ORDER_TYPE_BUY) ? 1.0 : -1.0) *
                          InpMaxSlippagePoints * _Point;
-   double stop = NormalizePriceToTick(signal_stop, order_type == ORDER_TYPE_SELL);
-   double min_stop_distance = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-   if(order_type == ORDER_TYPE_BUY && bid - stop < min_stop_distance)
-      stop = NormalizePriceToTick(bid - min_stop_distance, false);
-   if(order_type == ORDER_TYPE_SELL && stop - ask < min_stop_distance)
-      stop = NormalizePriceToTick(ask + min_stop_distance, true);
-
-   if((order_type == ORDER_TYPE_BUY && stop >= entry) ||
-      (order_type == ORDER_TYPE_SELL && stop <= entry))
+   double sizing_stop = SafeLevelPrice(order_type, sizing_entry,
+                                       stop_distance, true);
+   double estimated_stop = SafeLevelPrice(order_type, entry, stop_distance, true);
+   double estimated_tp1 = SafeLevelPrice(order_type, entry, tp1_distance, false);
+   double estimated_tp2 = SafeLevelPrice(order_type, entry, tp2_distance, false);
+   if(!ValidateSafeLevels(order_type, estimated_stop, estimated_tp1,
+                          estimated_tp2))
      {
-      Print("ActeckSmart Trader: SL после проверки брокерской дистанции оказался неверным; сделка пропущена");
+      Print("ActeckSmart Trader: фиксированные уровни Safe слишком близки к рынку или уже пройдены; сделка пропущена");
       return false;
      }
 
@@ -612,7 +740,7 @@ bool ExecuteSignal(const double direction, const double signal_stop,
    double risk_budget = AccountInfoDouble(ACCOUNT_BALANCE) *
                         InpRiskPercent / 100.0 *
                         (100.0 - InpExecutionCostReservePct) / 100.0 / 2.0;
-   double leg_volume = CalculateLegVolume(order_type, sizing_entry, stop,
+   double leg_volume = CalculateLegVolume(order_type, sizing_entry, sizing_stop,
                                            risk_budget, risk_per_lot);
    double max_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    if(max_volume <= 0.0)
@@ -636,7 +764,8 @@ bool ExecuteSignal(const double direction, const double signal_stop,
      }
 
    double total_loss = 0.0;
-   if(!OrderCalcProfit(order_type, _Symbol, leg_volume, sizing_entry, stop, total_loss) ||
+   if(!OrderCalcProfit(order_type, _Symbol, leg_volume, sizing_entry,
+                       sizing_stop, total_loss) ||
       MathAbs(total_loss) * 2.0 > AccountInfoDouble(ACCOUNT_BALANCE) *
                                   InpRiskPercent / 100.0 + 0.01)
      {
@@ -648,12 +777,14 @@ bool ExecuteSignal(const double direction, const double signal_stop,
 
    if(account_mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
      {
-      if(!ExecuteHedgingSafe(order_type, leg_volume, stop))
+      if(!ExecuteHedgingSafe(order_type, leg_volume, stop_distance,
+                             tp1_distance, tp2_distance))
          return false;
      }
    else
      {
-      if(!ExecuteNettingSafe(order_type, leg_volume, stop))
+      if(!ExecuteNettingSafe(order_type, leg_volume, stop_distance,
+                             tp1_distance, tp2_distance))
          return false;
      }
 
@@ -661,9 +792,10 @@ bool ExecuteSignal(const double direction, const double signal_stop,
    Print("ActeckSmart Trader: Safe открыт, symbol=", _Symbol,
          ", volume=", DoubleToString(g_last_trade_volume, VolumeDigits(
             SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP))),
-         ", SL=", DoubleToString(stop, _Digits),
-         ", marker TP1=", DoubleToString(signal_tp1, _Digits),
-         ", marker TP2=", DoubleToString(signal_tp2, _Digits),
+         ", SL distance=", DoubleToString(stop_distance, _Digits),
+         ", TP1 distance=", DoubleToString(tp1_distance, _Digits),
+         ", TP2 distance=", DoubleToString(tp2_distance, _Digits),
+         ", spec spread=", DoubleToString(effective_spread, _Digits),
          ", risk%=", DoubleToString(InpRiskPercent, 2),
          ", max leverage 1:", InpMaximumLeverage);
    return true;
@@ -681,10 +813,10 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
      }
 
-   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.12");
+   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.13");
    if(g_signal_handle == INVALID_HANDLE)
      {
-      Print("ActeckSmart Trader: прикрепите ActeckSmart v1.12 к основному окну этого графика до запуска советника, err=",
+      Print("ActeckSmart Trader: прикрепите ActeckSmart v1.13 к основному окну этого графика до запуска советника, err=",
             GetLastError());
       return INIT_FAILED;
      }
@@ -716,9 +848,11 @@ void OnTick()
    datetime closed_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 1);
    if(closed_bar == 0 || closed_bar == g_last_processed_bar)
       return;
-   double direction, stop, tp1, tp2, model;
+   double direction, entry, stop, tp1, tp2, model;
+   double spec_spread, spread_percent;
    bool buffers_ready = false;
-   bool has_signal = ReadSignal(closed_bar, direction, stop, tp1, tp2, model,
+   bool has_signal = ReadSignal(closed_bar, direction, entry, stop, tp1, tp2,
+                                model, spec_spread, spread_percent,
                                 buffers_ready);
    if(!buffers_ready)
       return;
@@ -735,6 +869,8 @@ void OnTick()
    Print("ActeckSmart Trader: подтверждён сигнал ", model_name, " ", side,
          " на ", _Symbol, " / ", EnumToString((ENUM_TIMEFRAMES)_Period));
 
-   if(InpAutoTrading && !ExecuteSignal(direction, stop, tp1, tp2))
+   if(InpAutoTrading &&
+      !ExecuteSignal(direction, entry, stop, tp1, tp2, spec_spread,
+                     spread_percent))
       Print("ActeckSmart Trader: ордера не открыты; см. предыдущие причины в журнале");
   }

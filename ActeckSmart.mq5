@@ -5,16 +5,16 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.12"
-#property description "ActeckSmart v1.12 — КЗ, модели расширения и сигналы входа"
+#property version   "1.13"
+#property description "ActeckSmart v1.13 — КЗ, модели расширения и сигналы входа"
 #property indicator_chart_window
-#property indicator_buffers 7
+#property indicator_buffers 9
 #property indicator_plots   1
 #property indicator_type1   DRAW_NONE
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.12"
+#define AS_VERSION   "1.13"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -112,7 +112,9 @@ input bool   InpEnableCascadeSignals = true;      // Сигналы каскад
 input double InpBaseEntryFib         = 0.382;     // Глубина зоны входа базовой модели
 input double InpCascadeEntryFib      = 0.236;     // Глубина зоны входа каскада
 input int    InpSignalHistoryBars    = 3000;      // История сигналов на текущем ТФ
-input int    InpSignalStopBuffer     = 2;         // Буфер SL за экстремумом (пункты)
+input int    InpSignalStopPoints     = 10;        // Фиксированный SL в points терминала
+input int    InpSignalTP1Points      = 10;        // Фиксированный TP1 в points терминала
+input int    InpSignalTP2Points      = 20;        // Фиксированный TP2 в points терминала
 input int    InpSignalLevelBars      = 24;        // Длина линий SL/TP (баров текущего ТФ)
 input bool   InpSignalAlerts         = true;      // Алерт нового сигнала
 input bool   InpShowSignalLevels     = true;      // Показывать уровни SL/TP на графике
@@ -231,6 +233,8 @@ struct STradeSignal
    double stop_loss;
    double take_profit_1;
    double take_profit_2;
+   double spread_price;
+   double spread_percent;
   };
 
 bool     g_allow_cont_alerts = false;
@@ -243,7 +247,147 @@ double   g_signal_tp1[];
 double   g_signal_tp2[];
 double   g_signal_model[];
 double   g_signal_processed_time[];
+double   g_signal_spread_price[];
+double   g_signal_spread_percent[];
 MqlRates g_signal_rates[];
+
+string NormalizeInstrumentCode(string symbol)
+  {
+   StringToUpper(symbol);
+   string normalized = "";
+   for(int i = 0; i < StringLen(symbol); i++)
+     {
+      ushort ch = StringGetCharacter(symbol, i);
+      if((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))
+         normalized += StringSubstr(symbol, i, 1);
+     }
+   return normalized;
+  }
+
+bool MatchInstrumentCode(const string normalized_symbol,
+                         const string instrument_code)
+  {
+   return (normalized_symbol == instrument_code ||
+           StringFind(normalized_symbol, instrument_code) >= 0);
+  }
+
+bool GetContractSpecSpreadPrice(const string symbol, const double reference_price,
+                                double &spread_price, double &spread_percent)
+  {
+   spread_price = 0.0;
+   spread_percent = 0.0;
+   string normalized = NormalizeInstrumentCode(symbol);
+
+   string fx_codes[] =
+     {
+      "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD",
+      "AUDCAD","AUDNZD","AUDJPY","GBPNZD","AUDCHF","EURAUD","CHFJPY",
+      "EURGBP","EURCHF","EURJPY","EURNZD","EURCAD","EURNOK","GBPAUD",
+      "GBPCAD","GBPCHF","GBPJPY","USDNOK","USDZAR","USDMXN","USDDKK",
+      "EURDKK","USDSEK","EURSEK","USDCNY","EURCNY","USDTRY","EURTRY",
+      "USDSGD","USDILS"
+     };
+   double fx_spreads[] =
+     {
+      1.4,2.1,2.0,2.0,2.1,2.3,2.5,2.2,5.4,2.4,6.8,2.6,4.0,2.5,
+      2.0,2.1,2.2,6.1,4.5,35.0,5.4,4.5,4.0,4.6,35.0,85.0,75.0,
+      20.0,20.0,35.0,35.0,20.0,25.0,3000.0,3200.0,5.0,7.0
+     };
+   int fx_match = -1;
+   int fx_match_length = 0;
+   for(int i = 0; i < ArraySize(fx_codes); i++)
+      if(StringLen(fx_codes[i]) > fx_match_length &&
+         MatchInstrumentCode(normalized, fx_codes[i]))
+        {
+         fx_match = i;
+         fx_match_length = StringLen(fx_codes[i]);
+        }
+
+   if(fx_match >= 0)
+     {
+      string code = fx_codes[fx_match];
+      if(code == "USDDKK" || code == "EURDKK" || code == "USDSEK" ||
+         code == "EURSEK" || code == "EURNOK" || code == "USDNOK" ||
+         code == "USDZAR" || code == "USDMXN" || code == "USDCNY" ||
+         code == "EURCNY" || code == "USDTRY" || code == "EURTRY" ||
+         code == "USDSGD" || code == "USDILS")
+        {
+         long digits = SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+         double spec_point = (digits <= 3) ? 0.01 : 0.0001;
+         spread_price = fx_spreads[fx_match] * spec_point;
+        }
+      else
+        {
+         bool jpy_quote = (StringFind(code, "JPY") == StringLen(code) - 3);
+         double pip_size = jpy_quote ? 0.01 : 0.0001;
+         spread_price = fx_spreads[fx_match] * pip_size;
+        }
+      return (spread_price > 0.0);
+     }
+
+   string rub_codes[] = {"USDRUB","EURRUB","CNYRUB","TRYRUB"};
+   double rub_spreads[] = {0.15,0.20,0.014,0.10};
+   for(int i = 0; i < ArraySize(rub_codes); i++)
+      if(MatchInstrumentCode(normalized, rub_codes[i]))
+        {
+         spread_price = rub_spreads[i];
+         return true;
+        }
+
+   string point_codes[] = {"XAUUSD","XAGUSD","XPDUSD","XPTUSD","LCO"};
+   double point_spreads[] = {45.0,90.0,600.0,500.0,10.0};
+   for(int i = 0; i < ArraySize(point_codes); i++)
+      if(MatchInstrumentCode(normalized, point_codes[i]))
+        {
+         double minimum_price_change = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+         if(minimum_price_change <= 0.0)
+            minimum_price_change = SymbolInfoDouble(symbol, SYMBOL_POINT);
+         if(minimum_price_change <= 0.0)
+            return false;
+         spread_price = point_spreads[i] * minimum_price_change;
+         return true;
+        }
+
+   string percent_codes[] =
+     {
+      "SBER","LKOH","AAPL","AMZN","TSLA","GOOGL","MSFT","NVDA","SPX","NDX",
+      "ROSN","NVTK","GAZP","GMKN","MOEX","BAC","CSCO","PEP","KO","MCD",
+      "NLMK","PHOR","MGNT","MTSS","AFLT","ALRS","MTLR","HD","AVGO","ADBE",
+      "HPE","CVX","DELL","INTC","TATN","SNGS","CHMF","PIKK","IRAO","RUAL",
+      "RTKM","AFKS","VKCO","FLOT","JPM","UNH","PG","MA","PFE","XOM","DIS",
+      "PYPL","WMT","VTBR","YDEX","NFLX","WFC","MRK","COIN","MSTR","IBIT",
+      "ORCL","AMD","CRM","WDC","GS","BTCUSD","ETHUSD"
+     };
+   double percent_spreads[] =
+     {
+      0.15,0.15,0.20,0.20,0.20,0.20,0.20,0.20,0.10,0.10,
+      0.15,0.15,0.15,0.15,0.15,0.20,0.20,0.20,0.20,0.20,
+      0.15,0.20,0.20,0.15,0.20,0.20,0.20,0.20,0.20,0.20,
+      0.20,0.20,0.20,0.20,0.20,0.20,0.20,0.30,0.30,0.20,
+      0.20,0.20,0.30,0.30,0.20,0.20,0.20,0.20,0.20,0.20,
+      0.20,0.20,0.20,0.15,0.20,0.20,0.20,0.20,0.20,0.20,
+      0.20,0.20,0.20,0.20,0.20,0.20,0.06,0.09
+     };
+   int percent_match = -1;
+   int percent_match_length = 0;
+   for(int i = 0; i < ArraySize(percent_codes); i++)
+      if(StringLen(percent_codes[i]) > percent_match_length &&
+         MatchInstrumentCode(normalized, percent_codes[i]))
+        {
+         percent_match = i;
+         percent_match_length = StringLen(percent_codes[i]);
+        }
+   if(percent_match >= 0 && reference_price > 0.0)
+     {
+      spread_percent = percent_spreads[percent_match] / 100.0;
+      spread_price = reference_price * spread_percent;
+      return (spread_price > 0.0);
+     }
+
+   Print("ActeckSmart: в спецификации спредов не найден инструмент ",
+         symbol, "; торговый сигнал не формируется");
+   return false;
+  }
 
 //+------------------------------------------------------------------+
 //| Вспомогательные функции времени и сессий                         |
@@ -1114,9 +1258,6 @@ public:
       ArrayResize(signals, 0);
       if(m_kz == NULL || total <= 0)
          return;
-      double min_stop_points = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-      double stop_buffer = MathMax((double)InpSignalStopBuffer, min_stop_points) * _Point;
-
       for(int i = 0; i < ArraySize(m_items); i++)
         {
          SContinued item = m_items[i];
@@ -1185,11 +1326,16 @@ public:
                continue;
 
             double entry = chart_rates[bar].close;
-            double stop = (item.direction == DIR_UP)
-                          ? chart_rates[bar].low - stop_buffer
-                          : chart_rates[bar].high + stop_buffer;
-            double risk_distance = MathAbs(entry - stop);
-            if(risk_distance <= _Point)
+            double spread_price = 0.0, spread_percent = 0.0;
+            if(!GetContractSpecSpreadPrice(_Symbol, entry, spread_price,
+                                           spread_percent))
+               break;
+
+            double stop_distance = InpSignalStopPoints * _Point + spread_price;
+            double tp1_distance = InpSignalTP1Points * _Point + spread_price;
+            double tp2_distance = InpSignalTP2Points * _Point + spread_price;
+            if(stop_distance <= 0.0 || tp1_distance <= 0.0 ||
+               tp2_distance <= 0.0)
                break;
 
             double target = 0.0;
@@ -1197,10 +1343,12 @@ public:
                                       entry, target))
                break;
 
-            double tp1 = (item.direction == DIR_UP) ? entry + risk_distance
-                                                    : entry - risk_distance;
-            double tp2 = (item.direction == DIR_UP) ? entry + risk_distance * 2.0
-                                                    : entry - risk_distance * 2.0;
+            double stop = (item.direction == DIR_UP)
+                          ? entry - stop_distance : entry + stop_distance;
+            double tp1 = (item.direction == DIR_UP)
+                         ? entry + tp1_distance : entry - tp1_distance;
+            double tp2 = (item.direction == DIR_UP)
+                         ? entry + tp2_distance : entry - tp2_distance;
             if((item.direction == DIR_UP && target < tp2) ||
                (item.direction == DIR_DOWN && target > tp2))
                break;
@@ -1214,6 +1362,8 @@ public:
             signal.stop_loss = NormalizeDouble(stop, _Digits);
             signal.take_profit_1 = NormalizeDouble(tp1, _Digits);
             signal.take_profit_2 = NormalizeDouble(tp2, _Digits);
+            signal.spread_price = spread_price;
+            signal.spread_percent = spread_percent;
 
             int n = ArraySize(signals);
             ArrayResize(signals, n + 1);
@@ -1915,6 +2065,8 @@ void ProcessTradeSignals(const bool alert_latest)
    ArrayInitialize(g_signal_tp2, EMPTY_VALUE);
    ArrayInitialize(g_signal_model, EMPTY_VALUE);
    ArrayInitialize(g_signal_processed_time, EMPTY_VALUE);
+   ArrayInitialize(g_signal_spread_price, EMPTY_VALUE);
+   ArrayInitialize(g_signal_spread_percent, EMPTY_VALUE);
    ObjectsDeleteAll(ChartID(), InpPrefix + "SG_", -1, -1);
 
    int requested = MathMax(InpSignalHistoryBars, 100);
@@ -1952,6 +2104,8 @@ void ProcessTradeSignals(const bool alert_latest)
       g_signal_tp1[shift] = signal.take_profit_1;
       g_signal_tp2[shift] = signal.take_profit_2;
       g_signal_model[shift] = (double)signal.model;
+      g_signal_spread_price[shift] = signal.spread_price;
+      g_signal_spread_percent[shift] = signal.spread_percent;
       DrawTradeSignal(signal);
 
       if(alert_latest && InpSignalAlerts && signal.time == latest_closed_time &&
@@ -1999,6 +2153,8 @@ int OnInit()
    SetIndexBuffer(4, g_signal_tp2, INDICATOR_DATA);
    SetIndexBuffer(5, g_signal_model, INDICATOR_DATA);
    SetIndexBuffer(6, g_signal_processed_time, INDICATOR_DATA);
+   SetIndexBuffer(7, g_signal_spread_price, INDICATOR_DATA);
+   SetIndexBuffer(8, g_signal_spread_percent, INDICATOR_DATA);
    ArraySetAsSeries(g_dummy_buf, true);
    ArraySetAsSeries(g_signal_direction, true);
    ArraySetAsSeries(g_signal_stop, true);
@@ -2006,6 +2162,8 @@ int OnInit()
    ArraySetAsSeries(g_signal_tp2, true);
    ArraySetAsSeries(g_signal_model, true);
    ArraySetAsSeries(g_signal_processed_time, true);
+   ArraySetAsSeries(g_signal_spread_price, true);
+   ArraySetAsSeries(g_signal_spread_percent, true);
    PlotIndexSetInteger(0, PLOT_DRAW_TYPE, DRAW_NONE);
    PlotIndexSetInteger(0, PLOT_SHOW_DATA, false);
    PlotIndexSetString(0, PLOT_LABEL, AS_SHORTNAME);
@@ -2014,7 +2172,9 @@ int OnInit()
 
    if(InpBaseEntryFib <= 0.0 || InpBaseEntryFib >= 1.0 ||
       InpCascadeEntryFib <= 0.0 || InpCascadeEntryFib >= 1.0 ||
-      InpSignalHistoryBars < 10 || InpSignalStopBuffer < 0 ||
+      InpSignalHistoryBars < 10 || InpSignalStopPoints <= 0 ||
+      InpSignalTP1Points <= 0 || InpSignalTP2Points <= 0 ||
+      InpSignalTP2Points < InpSignalTP1Points ||
       InpSignalLevelBars < 1)
      {
       Print("ActeckSmart: некорректные параметры сигналов");
