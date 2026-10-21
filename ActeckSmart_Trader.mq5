@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.13"
+#property version   "1.14"
 #property description "Советник Safe для ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
@@ -813,10 +813,10 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
      }
 
-   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.13");
+   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.14");
    if(g_signal_handle == INVALID_HANDLE)
      {
-      Print("ActeckSmart Trader: прикрепите ActeckSmart v1.13 к основному окну этого графика до запуска советника, err=",
+      Print("ActeckSmart Trader: прикрепите ActeckSmart v1.14 к основному окну этого графика до запуска советника, err=",
             GetLastError());
       return INIT_FAILED;
      }

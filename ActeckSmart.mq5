@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.13"
-#property description "ActeckSmart v1.13 — КЗ, модели расширения и сигналы входа"
+#property version   "1.14"
+#property description "ActeckSmart v1.14 — КЗ, модели расширения и сигналы входа"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.13"
+#define AS_VERSION   "1.14"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -112,9 +112,9 @@ input bool   InpEnableCascadeSignals = true;      // Сигналы каскад
 input double InpBaseEntryFib         = 0.382;     // Глубина зоны входа базовой модели
 input double InpCascadeEntryFib      = 0.236;     // Глубина зоны входа каскада
 input int    InpSignalHistoryBars    = 3000;      // История сигналов на текущем ТФ
-input int    InpSignalStopPoints     = 10;        // Фиксированный SL в points терминала
-input int    InpSignalTP1Points      = 10;        // Фиксированный TP1 в points терминала
-input int    InpSignalTP2Points      = 20;        // Фиксированный TP2 в points терминала
+input int    InpSignalStopPoints     = 10;        // Фиксированный SL в пунктах спецификации
+input int    InpSignalTP1Points      = 10;        // Фиксированный TP1 в пунктах спецификации
+input int    InpSignalTP2Points      = 20;        // Фиксированный TP2 в пунктах спецификации
 input int    InpSignalLevelBars      = 24;        // Длина линий SL/TP (баров текущего ТФ)
 input bool   InpSignalAlerts         = true;      // Алерт нового сигнала
 input bool   InpShowSignalLevels     = true;      // Показывать уровни SL/TP на графике
@@ -272,10 +272,12 @@ bool MatchInstrumentCode(const string normalized_symbol,
   }
 
 bool GetContractSpecSpreadPrice(const string symbol, const double reference_price,
-                                double &spread_price, double &spread_percent)
+                                double &spread_price, double &spread_percent,
+                                double &specification_point_price)
   {
    spread_price = 0.0;
    spread_percent = 0.0;
+   specification_point_price = 0.0;
    string normalized = NormalizeInstrumentCode(symbol);
 
    string fx_codes[] =
@@ -314,15 +316,17 @@ bool GetContractSpecSpreadPrice(const string symbol, const double reference_pric
         {
          long digits = SymbolInfoInteger(symbol, SYMBOL_DIGITS);
          double spec_point = (digits <= 3) ? 0.01 : 0.0001;
+         specification_point_price = spec_point;
          spread_price = fx_spreads[fx_match] * spec_point;
         }
       else
         {
          bool jpy_quote = (StringFind(code, "JPY") == StringLen(code) - 3);
          double pip_size = jpy_quote ? 0.01 : 0.0001;
+         specification_point_price = pip_size;
          spread_price = fx_spreads[fx_match] * pip_size;
         }
-      return (spread_price > 0.0);
+      return (spread_price > 0.0 && specification_point_price > 0.0);
      }
 
    string rub_codes[] = {"USDRUB","EURRUB","CNYRUB","TRYRUB"};
@@ -330,8 +334,10 @@ bool GetContractSpecSpreadPrice(const string symbol, const double reference_pric
    for(int i = 0; i < ArraySize(rub_codes); i++)
       if(MatchInstrumentCode(normalized, rub_codes[i]))
         {
+         long digits = SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+         specification_point_price = (digits <= 3) ? 0.01 : 0.0001;
          spread_price = rub_spreads[i];
-         return true;
+         return (specification_point_price > 0.0);
         }
 
    string point_codes[] = {"XAUUSD","XAGUSD","XPDUSD","XPTUSD","LCO"};
@@ -344,6 +350,7 @@ bool GetContractSpecSpreadPrice(const string symbol, const double reference_pric
             minimum_price_change = SymbolInfoDouble(symbol, SYMBOL_POINT);
          if(minimum_price_change <= 0.0)
             return false;
+         specification_point_price = minimum_price_change;
          spread_price = point_spreads[i] * minimum_price_change;
          return true;
         }
@@ -379,6 +386,11 @@ bool GetContractSpecSpreadPrice(const string symbol, const double reference_pric
         }
    if(percent_match >= 0 && reference_price > 0.0)
      {
+      specification_point_price = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(specification_point_price <= 0.0)
+         specification_point_price = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      if(specification_point_price <= 0.0)
+         return false;
       spread_percent = percent_spreads[percent_match] / 100.0;
       spread_price = reference_price * spread_percent;
       return (spread_price > 0.0);
@@ -1327,13 +1339,18 @@ public:
 
             double entry = chart_rates[bar].close;
             double spread_price = 0.0, spread_percent = 0.0;
+            double specification_point_price = 0.0;
             if(!GetContractSpecSpreadPrice(_Symbol, entry, spread_price,
-                                           spread_percent))
+                                           spread_percent,
+                                           specification_point_price))
                break;
 
-            double stop_distance = InpSignalStopPoints * _Point + spread_price;
-            double tp1_distance = InpSignalTP1Points * _Point + spread_price;
-            double tp2_distance = InpSignalTP2Points * _Point + spread_price;
+            double stop_distance = InpSignalStopPoints *
+                                   specification_point_price + spread_price;
+            double tp1_distance = InpSignalTP1Points *
+                                  specification_point_price + spread_price;
+            double tp2_distance = InpSignalTP2Points *
+                                  specification_point_price + spread_price;
             if(stop_distance <= 0.0 || tp1_distance <= 0.0 ||
                tp2_distance <= 0.0)
                break;
