@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.10"
-#property description "ActeckSmart v1.10 — КЗ, модели расширения и сигналы входа"
+#property version   "1.12"
+#property description "ActeckSmart v1.12 — КЗ, модели расширения и сигналы входа"
 #property indicator_chart_window
 #property indicator_buffers 7
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.10"
+#define AS_VERSION   "1.12"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -113,7 +113,7 @@ input double InpBaseEntryFib         = 0.382;     // Глубина зоны в�
 input double InpCascadeEntryFib      = 0.236;     // Глубина зоны входа каскада
 input int    InpSignalHistoryBars    = 3000;      // История сигналов на текущем ТФ
 input int    InpSignalStopBuffer     = 2;         // Буфер SL за экстремумом (пункты)
-input int    InpSignalLevelBars      = 12;        // Длина линий SL/TP (баров текущего ТФ)
+input int    InpSignalLevelBars      = 24;        // Длина линий SL/TP (баров текущего ТФ)
 input bool   InpSignalAlerts         = true;      // Алерт нового сигнала
 input bool   InpShowSignalLevels     = true;      // Показывать уровни SL/TP на графике
 
@@ -388,6 +388,41 @@ bool ShouldDeleteByAge(const datetime object_day, const datetime now_broker)
    return (days >= InpFadeDays2 + 1);
   }
 
+int DeletePrefixedObjects(const long chart_id, const string prefix)
+  {
+   int deleted = ObjectsDeleteAll(chart_id, prefix, -1, -1);
+   ChartRedraw(chart_id);
+
+   // Удаляем оставшиеся объекты по именам, чтобы очистить и графику,
+   // созданную до версии, использующей ObjectsDeleteAll.
+   for(int i = ObjectsTotal(chart_id, -1, -1) - 1; i >= 0; i--)
+     {
+      string name = ObjectName(chart_id, i, -1, -1);
+      if(StringFind(name, prefix) != 0)
+         continue;
+
+      ResetLastError();
+      if(ObjectDelete(chart_id, name))
+         deleted++;
+      else
+         Print("ActeckSmart: не удалось удалить объект ", name,
+               ", err=", GetLastError());
+     }
+
+   ChartRedraw(chart_id);
+   int remaining = 0;
+   for(int i = ObjectsTotal(chart_id, -1, -1) - 1; i >= 0; i--)
+     {
+      string name = ObjectName(chart_id, i, -1, -1);
+      if(StringFind(name, prefix) == 0)
+         remaining++;
+     }
+   if(remaining > 0)
+      Print("ActeckSmart: после удаления осталось объектов с префиксом ",
+            prefix, ": ", remaining);
+   return deleted;
+  }
+
 //+------------------------------------------------------------------+
 //| Класс: менеджер графических объектов                             |
 //+------------------------------------------------------------------+
@@ -412,9 +447,7 @@ public:
    void DeleteAll(const bool include_hud = false)
      {
       long cid = (m_chart != 0) ? m_chart : ChartID();
-      ObjectsDeleteAll(0, m_prefix, -1, -1);
-      if(cid != 0)
-         ObjectsDeleteAll(cid, m_prefix, -1, -1);
+      DeletePrefixedObjects(cid, m_prefix);
      }
 
    bool Trend(const string name, datetime t1, double p1, datetime t2, double p2,
@@ -1832,12 +1865,37 @@ void DrawTradeSignal(const STradeSignal &signal)
      {
       datetime line_end = signal.time + PeriodSeconds((ENUM_TIMEFRAMES)_Period) *
                           InpSignalLevelBars;
-      g_gfx.HLineSegment("SG_SL_" + key, signal.time, line_end, signal.stop_loss,
-                         clrRed, 2, STYLE_SOLID);
-      g_gfx.HLineSegment("SG_TP1_" + key, signal.time, line_end,
-                         signal.take_profit_1, clrLimeGreen, 2, STYLE_SOLID);
-      g_gfx.HLineSegment("SG_TP2_" + key, signal.time, line_end,
-                         signal.take_profit_2, clrDodgerBlue, 2, STYLE_DASH);
+      bool sl_drawn = g_gfx.HLineSegment("SG_SL_" + key, signal.time, line_end,
+                                         signal.stop_loss, clrRed, 2, STYLE_SOLID);
+      bool tp1_drawn = g_gfx.HLineSegment("SG_TP1_" + key, signal.time, line_end,
+                                          signal.take_profit_1, clrLimeGreen, 2,
+                                          STYLE_SOLID);
+      bool tp2_drawn = g_gfx.HLineSegment("SG_TP2_" + key, signal.time, line_end,
+                                          signal.take_profit_2, clrDodgerBlue, 2,
+                                          STYLE_DASH);
+      if(!sl_drawn || !tp1_drawn || !tp2_drawn)
+         Print("ActeckSmart: не удалось создать объект уровня сигнала ",
+               key, "; SL=", sl_drawn, ", TP1=", tp1_drawn,
+               ", TP2=", tp2_drawn, ", err=", GetLastError());
+
+      datetime label_time = signal.time +
+                            PeriodSeconds((ENUM_TIMEFRAMES)_Period) * 3;
+      bool sl_label = g_gfx.TextLabel("SG_SL_TX_" + key, label_time,
+                                      signal.stop_loss,
+                                      "SL " + DoubleToString(signal.stop_loss, _Digits),
+                                      clrRed, InpKZFont, InpKZFontSize);
+      bool tp1_label = g_gfx.TextLabel("SG_TP1_TX_" + key, label_time,
+                                       signal.take_profit_1,
+                                       "TP1 " + DoubleToString(signal.take_profit_1, _Digits),
+                                       clrLimeGreen, InpKZFont, InpKZFontSize);
+      bool tp2_label = g_gfx.TextLabel("SG_TP2_TX_" + key, label_time,
+                                       signal.take_profit_2,
+                                       "TP2 " + DoubleToString(signal.take_profit_2, _Digits),
+                                       clrDodgerBlue, InpKZFont, InpKZFontSize);
+      if(!sl_label || !tp1_label || !tp2_label)
+         Print("ActeckSmart: не удалось создать подписи уровней сигнала ",
+               key, "; SL=", sl_label, ", TP1=", tp1_label,
+               ", TP2=", tp2_label, ", err=", GetLastError());
      }
 
    string model = (signal.model == SIGNAL_MODEL_CASCADE) ? "КАСКАД" : "БАЗОВАЯ";
@@ -1909,6 +1967,7 @@ void ProcessTradeSignals(const bool alert_latest)
          g_last_trade_signal_time = signal.time;
         }
      }
+   ChartRedraw(ChartID());
   }
 
 //+------------------------------------------------------------------+
@@ -1963,9 +2022,8 @@ int OnInit()
      }
 
    g_gfx.Init(ChartID(), InpPrefix);
-   // Снести артефакты прошлой сессии / старых версий (TITLE, RSI_LB, AS_*)
-   ObjectsDeleteAll(0, InpPrefix, -1, -1);
-   ObjectsDeleteAll(ChartID(), InpPrefix, -1, -1);
+   // Удалить артефакты прошлой сессии / старых версий на текущем графике.
+   DeletePrefixedObjects(ChartID(), InpPrefix);
 
    g_kz.SetZigZag(GetPointer(g_zz1));
    g_cont.SetKZ(GetPointer(g_kz));
@@ -2004,17 +2062,12 @@ void OnDeinit(const int reason)
       g_bollinger_handle = INVALID_HANDLE;
      }
 
-   // 2) Синхронный wipe — ObjectDelete в цикле в OnDeinit НЕ успевает
+   // 2) Удалить все объекты индикатора, включая остатки предыдущих версий.
    long cid = ChartID();
-   int n0 = ObjectsDeleteAll(0, InpPrefix, -1, -1);
-   int n1 = (cid != 0) ? ObjectsDeleteAll(cid, InpPrefix, -1, -1) : 0;
+   int deleted = DeletePrefixedObjects(cid, InpPrefix);
 
-   ChartRedraw(0);
-   if(cid != 0)
-      ChartRedraw(cid);
-
-   PrintFormat("ActeckSmart: OnDeinit reason=%d, ObjectsDeleteAll=%d+%d, prefix=%s",
-               reason, n0, n1, InpPrefix);
+   PrintFormat("ActeckSmart: OnDeinit reason=%d, deleted_objects=%d, prefix=%s",
+               reason, deleted, InpPrefix);
   }
 
 int OnCalculate(const int rates_total,
