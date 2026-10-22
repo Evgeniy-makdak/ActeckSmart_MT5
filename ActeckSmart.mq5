@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.18"
-#property description "ActeckSmart v1.18 — КЗ, модели расширения и сигналы входа"
+#property version   "1.26"
+#property description "ActeckSmart v1.26 — КЗ, модели расширения и сигналы входа"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.18"
+#define AS_VERSION   "1.26"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -110,8 +110,6 @@ input color  InpBBLowerColor         = clrBlue;   // Нижняя полоса
 input string InpSepSignals           = "======== СИГНАЛЫ РАСШИРЕНИЯ ========"; // —
 input bool   InpEnableBaseSignals    = true;      // Сигналы базового расширения
 input bool   InpEnableCascadeSignals = true;      // Сигналы каскадного расширения
-input double InpBaseEntryFib         = 0.382;     // Глубина зоны входа базовой модели
-input double InpCascadeEntryFib      = 0.236;     // Глубина зоны входа каскада
 input int    InpSignalHistoryBars    = 3000;      // История сигналов на текущем ТФ
 input int    InpSignalStopPoints     = 10;        // Фиксированный SL в пунктах спецификации
 input int    InpSignalTP1Points      = 10;        // Фиксированный TP1 в пунктах спецификации
@@ -230,6 +228,7 @@ struct STradeSignal
   {
    datetime time;
    datetime setup_time;
+   int      structure_index;
    ENUM_DIR direction;
    ENUM_SIGNAL_MODEL model;
    double candle_high;
@@ -1334,6 +1333,27 @@ public:
       return count;
      }
 
+   bool GetInterestZoneBounds(const SContinued &item,
+                              double &zone_low, double &zone_high) const
+     {
+      if(InpFibLevel <= 0.0 || InpFibLevel >= 1.0)
+         return false;
+      double fib = item.unbroken_kz +
+                   (item.price_break - item.unbroken_kz) * InpFibLevel;
+      zone_low = MathMin(item.unbroken_kz, fib);
+      zone_high = MathMax(item.unbroken_kz, fib);
+      return (zone_high > zone_low);
+     }
+
+   bool IsSignalWithinZoneRetention(const int structure_index,
+                                    const datetime now_broker) const
+     {
+      if(structure_index < 0 || structure_index >= ArraySize(m_items))
+         return false;
+      return !ShouldDeleteByAge(m_items[structure_index].time_start,
+                                now_broker);
+     }
+
    void BuildSignals(const MqlRates &chart_rates[], const int total,
                      STradeSignal &signals[]) const
      {
@@ -1351,8 +1371,6 @@ public:
 
          SContinued previous = m_items[i - 1];
          ENUM_SIGNAL_MODEL model;
-         double impulse_start = item.price_break;
-         double impulse_end = item.price_end;
          // Два однонаправленных движения с двумя новыми КЗ образуют каскад;
          // противоположные последовательные движения подтверждают базовую модель.
          if(previous.direction == item.direction &&
@@ -1360,8 +1378,6 @@ public:
             CountNewZones(previous.time_end, item.time_end) >= 2)
            {
             model = SIGNAL_MODEL_CASCADE;
-            impulse_start = previous.price_break;
-            impulse_end = item.price_end;
            }
          else if(previous.direction != item.direction &&
                  previous.time_end < item.time_start)
@@ -1373,39 +1389,58 @@ public:
             (model == SIGNAL_MODEL_CASCADE && !InpEnableCascadeSignals))
             continue;
 
-         double impulse = MathAbs(impulse_end - impulse_start);
-         if(impulse <= _Point)
-            continue;
-
-         double fib = (model == SIGNAL_MODEL_CASCADE)
-                      ? InpCascadeEntryFib : InpBaseEntryFib;
-         if(fib <= 0.0 || fib >= 1.0)
-            continue;
-
          double zone_low, zone_high;
-         if(item.direction == DIR_UP)
-           {
-            zone_low = impulse_end - impulse * fib;
-            zone_high = impulse_end;
-           }
-         else
-           {
-            zone_low = impulse_end;
-            zone_high = impulse_end + impulse * fib;
-           }
+         if(!GetInterestZoneBounds(item, zone_low, zone_high))
+            continue;
 
+         bool zone_revisited = false;
          for(int bar = 0; bar < total; bar++)
            {
             if(chart_rates[bar].time <= item.time_end)
                continue;
-            if(item.direction == DIR_UP && chart_rates[bar].low <= impulse_start)
+
+            bool intersects_zone = (chart_rates[bar].low <= zone_high &&
+                                    chart_rates[bar].high >= zone_low);
+            bool swept_this_bar =
+               (item.direction == DIR_DOWN && chart_rates[bar].high > zone_high) ||
+               (item.direction == DIR_UP && chart_rates[bar].low < zone_low);
+            if(!zone_revisited)
               {
-               break;
+               if(bar == 0)
+                  continue;
+
+               // Downward СПД формирует ЗИ продавцов выше себя:
+               // цена должна прийти снизу. Для upward СПД — наоборот.
+               bool previous_bar_after_setup =
+                  (chart_rates[bar - 1].time >= item.time_end);
+               bool approached_from_expected_side = false;
+               if(previous_bar_after_setup)
+                  approached_from_expected_side =
+                     (item.direction == DIR_DOWN)
+                     ? (chart_rates[bar - 1].close < zone_low)
+                     : (chart_rates[bar - 1].close > zone_high);
+               bool first_retest = (intersects_zone &&
+                                    approached_from_expected_side);
+               if(swept_this_bar &&
+                  (!first_retest ||
+                   chart_rates[bar].close < zone_low ||
+                   chart_rates[bar].close > zone_high))
+                  break;
+               if(!first_retest)
+                  continue;
+               zone_revisited = true;
+               if(!swept_this_bar)
+                  continue;
               }
-            if(item.direction == DIR_DOWN && chart_rates[bar].high >= impulse_start)
-               break;
-            if(chart_rates[bar].low > zone_high || chart_rates[bar].high < zone_low)
+
+            if(!swept_this_bar)
                continue;
+            // После первого выноса зона считается снятой. Сигнал допустим
+            // только на этой же свече, если она закрылась внутри ЗИ.
+            if(!zone_revisited || !intersects_zone ||
+               chart_rates[bar].close < zone_low ||
+               chart_rates[bar].close > zone_high)
+               break;
 
             double entry = chart_rates[bar].close;
             double spread_price = 0.0, spread_percent = 0.0;
@@ -1443,6 +1478,7 @@ public:
             STradeSignal signal;
             signal.time = chart_rates[bar].time;
             signal.setup_time = item.time_end;
+            signal.structure_index = i;
             signal.direction = item.direction;
             signal.model = model;
             signal.candle_high = chart_rates[bar].high;
@@ -1627,12 +1663,12 @@ public:
 
    // Состояние зоны по ликвидности: FRESH / TOUCHED / BROKEN
    ENUM_ZONE_STATE AssessZone(const SContinued &c, const MqlRates &rates[],
-                              const int total, double &z_lo, double &z_hi) const
+                              const int total, double &z_lo, double &z_hi,
+                              datetime &broken_time) const
      {
-      double span = c.price_break - c.unbroken_kz;
-      double fib  = c.unbroken_kz + span * InpFibLevel;
-      z_lo = MathMin(c.unbroken_kz, fib);
-      z_hi = MathMax(c.unbroken_kz, fib);
+      broken_time = 0;
+      if(!GetInterestZoneBounds(c, z_lo, z_hi))
+         return ZONE_BROKEN;
 
       bool touched = false;
       bool broken  = false;
@@ -1650,12 +1686,22 @@ public:
          if(c.direction == DIR_UP)
            {
             if(rates[i].low < z_lo)
+              {
                broken = true;
+               if(broken_time == 0)
+                  broken_time = rates[i].time;
+               break;
+              }
            }
          else if(c.direction == DIR_DOWN)
            {
             if(rates[i].high > z_hi)
+              {
                broken = true;
+               if(broken_time == 0)
+                  broken_time = rates[i].time;
+               break;
+              }
            }
         }
 
@@ -1666,41 +1712,121 @@ public:
       return ZONE_FRESH;
      }
 
+   bool IsSignalDisplayable(const STradeSignal &signal,
+                            const datetime now_broker) const
+     {
+      if(!InpShowInterestZones ||
+         !IsSignalWithinZoneRetention(signal.structure_index, now_broker))
+         return false;
+      double zone_low, zone_high;
+      SContinued item = m_items[signal.structure_index];
+      if(!GetInterestZoneBounds(item, zone_low, zone_high))
+         return false;
+      if(signal.entry < zone_low || signal.entry > zone_high)
+         return false;
+      bool candle_swept_zone =
+         (item.direction == DIR_DOWN && signal.candle_high > zone_high) ||
+         (item.direction == DIR_UP && signal.candle_low < zone_low);
+      if(!candle_swept_zone)
+         return false;
+      int m15_seconds = PeriodSeconds(WORK_TF);
+      int m15_shift = iBarShift(_Symbol, WORK_TF, signal.time, false);
+      if(m15_seconds <= 0 || m15_shift < 0)
+         return false;
+      datetime m15_bar_time = iTime(_Symbol, WORK_TF, m15_shift);
+      return (m15_bar_time >= item.time_start &&
+              signal.time >= m15_bar_time &&
+              signal.time < m15_bar_time + m15_seconds);
+     }
+
    void DrawZone(CChartObjects &gfx, const int idx, const SContinued &c,
                  const MqlRates &rates[], const int total,
-                 const datetime now_broker, const datetime zt2)
+                 const datetime now_broker, const datetime zt2,
+                 const bool signal_source = false,
+                 const datetime signal_time = 0) const
      {
       if(!InpShowInterestZones)
          return;
 
       double z_lo, z_hi;
-      ENUM_ZONE_STATE st = AssessZone(c, rates, total, z_lo, z_hi);
+      datetime broken_time;
+      ENUM_ZONE_STATE st = AssessZone(c, rates, total, z_lo, z_hi,
+                                      broken_time);
+      datetime signal_m15_time = 0;
+      if(signal_source)
+        {
+         int m15_shift = iBarShift(_Symbol, WORK_TF, signal_time, false);
+         if(m15_shift < 0)
+            return;
+         signal_m15_time = iTime(_Symbol, WORK_TF, m15_shift);
+         if(signal_m15_time == 0 ||
+            signal_time < signal_m15_time ||
+            signal_time >= signal_m15_time + PeriodSeconds(WORK_TF))
+            return;
+         st = ZONE_BROKEN;
+        }
 
       // Пробитые — не рисуем (ликвидность собрана, ориентир потерян)
-      if(st == ZONE_BROKEN && InpZoneHideBroken)
+      if(st == ZONE_BROKEN && InpZoneHideBroken && !signal_source)
          return;
 
       color zclr = (c.direction == DIR_UP) ? InpBuyZoneColor : InpSellZoneColor;
       zclr = ApplyFade(zclr, c.time_start, now_broker);
       int za = (st == ZONE_FRESH) ? InpZoneAlpha : InpZoneTouchedAlpha;
+      datetime zone_end = zt2;
+      if(signal_source)
+         zone_end = signal_m15_time + PeriodSeconds(WORK_TF);
+      else if(st == ZONE_BROKEN && broken_time != 0 && broken_time < zone_end)
+         zone_end = broken_time + PeriodSeconds(WORK_TF);
+      if(zone_end <= c.time_start)
+         return;
+      if(signal_source && (signal_time < c.time_start || signal_time >= zone_end))
+         return;
 
       string zname = "CM_Z_" + IntegerToString(idx);
-      gfx.Rectangle(zname, c.time_start, z_lo, zt2, z_hi, zclr, za);
+      gfx.Rectangle(zname, c.time_start, z_lo, zone_end, z_hi, zclr, za);
 
       if(InpZoneShowStateLabel)
         {
-         string state = (st == ZONE_FRESH) ? "НЕ ТРОНУТА"
-                        : ((st == ZONE_TOUCHED) ? "КАСАНИЕ" : "ПРОБИТА");
+         string structure_id = StringFormat("%03d", idx + 1);
+         string state = (signal_source) ? "ВЫНОС ЛИКВИДНОСТИ | СИГНАЛ"
+                        : ((st == ZONE_FRESH) ? "НЕ ТРОНУТА"
+                           : ((st == ZONE_TOUCHED) ? "КАСАНИЕ" : "ПРОБИТА"));
          string spd_period = "(от " + FormatDateTimeISO(c.time_start) +
                             " до " + FormatDateTimeISO(c.time_end) + ")";
-         state += " | СПД " + spd_period;
-         datetime label_time = zt2 - PeriodSeconds(WORK_TF) * 4;
+         string zone_type = (c.direction == DIR_UP)
+                            ? "ЗИ покупателей #" : "ЗИ продавцов #";
+         state = zone_type + structure_id + " | " + state +
+                 " | СПД " + spd_period;
+         datetime label_time = signal_source
+                               ? signal_time
+                               : zone_end - PeriodSeconds(WORK_TF) * 4;
+         if(label_time < c.time_start)
+            label_time = c.time_start;
          double label_price = (z_lo + z_hi) * 0.5;
          color label_color = (c.direction == DIR_UP) ? C'35,90,115' : C'125,65,75';
          label_color = ApplyFade(label_color, c.time_start, now_broker);
          gfx.TextLabel("CM_ZS_" + IntegerToString(idx),
                        label_time, label_price, state,
                        label_color, InpKZFont, InpKZFontSize, ANCHOR_RIGHT);
+        }
+     }
+
+   void DrawSignalSourceZones(CChartObjects &gfx, const MqlRates &rates[],
+                              const int total, const datetime now_broker,
+                              const STradeSignal &signals[]) const
+     {
+      if(!InpShowInterestZones || total <= 0)
+         return;
+      datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
+      for(int i = 0; i < ArraySize(signals); i++)
+        {
+         int structure_index = signals[i].structure_index;
+         if(!IsSignalDisplayable(signals[i], now_broker))
+            continue;
+         SContinued item = m_items[structure_index];
+         DrawZone(gfx, structure_index, item, rates, total, now_broker,
+                  zt2, true, signals[i].time);
         }
      }
 
@@ -1729,8 +1855,9 @@ public:
             IsFreshZoneWithinRetention(c.time_start, now_broker))
            {
             double zone_low, zone_high;
-            keep_fresh_zone = (AssessZone(c, rates, total, zone_low, zone_high) ==
-                               ZONE_FRESH);
+            datetime ignored_broken_time;
+            keep_fresh_zone = (AssessZone(c, rates, total, zone_low, zone_high,
+                                          ignored_broken_time) == ZONE_FRESH);
            }
          if(expired_by_age && !keep_fresh_zone)
             continue;
@@ -1757,6 +1884,18 @@ public:
 
          if(!hide_lines)
            {
+            string structure_id = StringFormat("%03d", i + 1);
+            double id_offset = InpKZLabelOffsetPoints * _Point;
+            double id_price = c.price_break +
+                              ((c.direction == DIR_UP) ? -id_offset : id_offset);
+            ENUM_ANCHOR_POINT id_anchor = (c.direction == DIR_UP)
+                                          ? ANCHOR_LEFT_UPPER
+                                          : ANCHOR_LEFT_LOWER;
+            gfx.TextLabel("CM_ID_" + IntegerToString(i),
+                          c.time_start + PeriodSeconds(WORK_TF),
+                          id_price, "СПД #" + structure_id, clr,
+                          InpKZFont, InpContFontSize, id_anchor);
+
             // Горизонтальная опора пробоя
             gfx.HLineSegment("CM_H0_" + IntegerToString(i),
                              c.time_start, t_h_end, c.price_break,
@@ -2109,6 +2248,7 @@ void RecalculateAll(void)
 void DrawTradeSignal(const STradeSignal &signal)
   {
    string key = IntegerToString((long)signal.time);
+   string zone_id = StringFormat("%03d", signal.structure_index + 1);
    color signal_color = (signal.direction == DIR_UP) ? clrDodgerBlue : clrRed;
    if(InpShowPotentialSignalBoxes)
      {
@@ -2147,15 +2287,18 @@ void DrawTradeSignal(const STradeSignal &signal)
                             PeriodSeconds((ENUM_TIMEFRAMES)_Period) * 3;
       bool sl_label = g_gfx.TextLabel("SG_SL_TX_" + key, label_time,
                                       signal.stop_loss,
-                                      "SL " + DoubleToString(signal.stop_loss, _Digits),
+                                      "SL #" + zone_id + " " +
+                                      DoubleToString(signal.stop_loss, _Digits),
                                       clrRed, InpKZFont, InpKZFontSize);
       bool tp1_label = g_gfx.TextLabel("SG_TP1_TX_" + key, label_time,
                                        signal.take_profit_1,
-                                       "TP1 " + DoubleToString(signal.take_profit_1, _Digits),
+                                       "TP1 #" + zone_id + " " +
+                                       DoubleToString(signal.take_profit_1, _Digits),
                                        clrLimeGreen, InpKZFont, InpKZFontSize);
       bool tp2_label = g_gfx.TextLabel("SG_TP2_TX_" + key, label_time,
                                        signal.take_profit_2,
-                                       "TP2 " + DoubleToString(signal.take_profit_2, _Digits),
+                                       "TP2 #" + zone_id + " " +
+                                       DoubleToString(signal.take_profit_2, _Digits),
                                        clrDodgerBlue, InpKZFont, InpKZFontSize);
       if(!sl_label || !tp1_label || !tp2_label)
          Print("ActeckSmart: не удалось создать подписи уровней сигнала ",
@@ -2168,7 +2311,7 @@ void DrawTradeSignal(const STradeSignal &signal)
    double label_price = (signal.direction == DIR_UP)
                         ? signal.entry - 6.0 * _Point : signal.entry + 6.0 * _Point;
    g_gfx.TextLabel("SG_TX_" + key, signal.time, label_price,
-                   model + " " + side, signal_color,
+                   model + " " + side + " | ЗИ #" + zone_id, signal_color,
                    InpKZFont, InpKZFontSize);
   }
 
@@ -2206,9 +2349,13 @@ void ProcessTradeSignals(const bool alert_latest)
      }
    STradeSignal signals[];
    g_cont.BuildSignals(g_signal_rates, closed_count, signals);
+   g_cont.DrawSignalSourceZones(g_gfx, g_rates, g_m15_closed_count,
+                                TimeCurrent(), signals);
    for(int i = 0; i < ArraySize(signals); i++)
      {
       STradeSignal signal = signals[i];
+      if(!g_cont.IsSignalDisplayable(signal, TimeCurrent()))
+         continue;
 
       int shift = iBarShift(_Symbol, (ENUM_TIMEFRAMES)_Period, signal.time, true);
       if(shift < 1 || shift >= ArraySize(g_signal_direction))
@@ -2285,9 +2432,7 @@ int OnInit()
    IndicatorSetString(INDICATOR_SHORTNAME, AS_SHORTNAME);
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
 
-   if(InpBaseEntryFib <= 0.0 || InpBaseEntryFib >= 1.0 ||
-      InpCascadeEntryFib <= 0.0 || InpCascadeEntryFib >= 1.0 ||
-      InpSignalHistoryBars < 10 || InpSignalStopPoints <= 0 ||
+   if(InpSignalHistoryBars < 10 || InpSignalStopPoints <= 0 ||
       InpSignalTP1Points <= 0 || InpSignalTP2Points <= 0 ||
       InpSignalTP2Points < InpSignalTP1Points ||
       InpSignalLevelBars < 1)
