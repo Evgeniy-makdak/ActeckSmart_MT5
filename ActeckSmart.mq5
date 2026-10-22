@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.15"
-#property description "ActeckSmart v1.15 — КЗ, модели расширения и сигналы входа"
+#property version   "1.18"
+#property description "ActeckSmart v1.18 — КЗ, модели расширения и сигналы входа"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.15"
+#define AS_VERSION   "1.18"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -94,6 +94,7 @@ input int    InpZoneAlpha            = 70;        // Непрозрачност�
 input int    InpZoneTouchedAlpha     = 45;        // Непрозрачность ЗАТРОНУТОЙ (не пробитой) зоны
 input bool   InpZoneHideBroken       = true;      // Не рисовать зоны, пробитые ценой (ликвидность снята)
 input bool   InpZoneShowStateLabel   = true;      // Показывать метку состояния зоны
+input int    InpFreshZoneKeepDays    = 7;         // Сколько дней показывать нетронутую зону
 input double InpFibLevel             = 0.382;     // Уровень Фибоначчи зоны интересов
 
 input string InpSepBB                = "======== ПОЛОСЫ БОЛЛИНДЖЕРА (M15) ========"; // —
@@ -118,6 +119,7 @@ input int    InpSignalTP2Points      = 20;        // Фиксированный 
 input int    InpSignalLevelBars      = 24;        // Длина линий SL/TP (баров текущего ТФ)
 input bool   InpSignalAlerts         = true;      // Алерт нового сигнала
 input bool   InpShowSignalLevels     = true;      // Показывать уровни SL/TP на графике
+input bool   InpShowPotentialSignalBoxes = true;  // Подсвечивать сигнальную свечу рамкой
 
 input string InpSepRSI               = "======== RSI HUD (как Sniper) ========"; // —
 input bool   InpShowRSI              = true;      // Показывать RSI в правом верхнем углу
@@ -126,6 +128,7 @@ input bool   InpRSIUseM15            = false;     // RSI на M15 (false = ТФ 
 input int    InpRSISparkBars         = 56;        // Баров в мини-графике RSI
 input int    InpRSIPanelWidth        = 168;       // Ширина панели RSI (px)
 input int    InpRSIPanelHeight       = 48;        // Высота панели RSI (px)
+input int    InpRSIPanelYOffset      = 42;        // Отступ панели сверху (px)
 input int    InpRSISparkWidth        = 108;       // Ширина мини-графика внутри панели (px)
 input int    InpRSIFontSize          = 26;        // Размер шрифта числа RSI
 input color  InpRSIColorMid          = C'34,139,34';   // Зелёный (35..65)
@@ -229,6 +232,8 @@ struct STradeSignal
    datetime setup_time;
    ENUM_DIR direction;
    ENUM_SIGNAL_MODEL model;
+   double candle_high;
+   double candle_low;
    double entry;
    double stop_loss;
    double take_profit_1;
@@ -554,35 +559,59 @@ bool ShouldDeleteByAge(const datetime object_day, const datetime now_broker)
    return (days >= InpFadeDays2 + 1);
   }
 
-int DeletePrefixedObjects(const long chart_id, const string prefix)
+bool IsFreshZoneWithinRetention(const datetime zone_time,
+                                const datetime now_broker)
   {
-   int deleted = ObjectsDeleteAll(chart_id, prefix, -1, -1);
-   ChartRedraw(chart_id);
+   if(InpKeepHistory)
+      return true;
+   datetime gmt_zone = BrokerToGMT(zone_time);
+   datetime gmt_now = BrokerToGMT(now_broker);
+   MqlDateTime zone_date, now_date;
+   TimeToStruct(gmt_zone, zone_date);
+   TimeToStruct(gmt_now, now_date);
+   datetime zone_day = StringToTime(StringFormat("%04d.%02d.%02d",
+                                                  zone_date.year,
+                                                  zone_date.mon,
+                                                  zone_date.day));
+   datetime current_day = StringToTime(StringFormat("%04d.%02d.%02d",
+                                                      now_date.year,
+                                                      now_date.mon,
+                                                      now_date.day));
+   int age_days = (int)((current_day - zone_day) / 86400);
+   return (age_days < InpFreshZoneKeepDays);
+  }
 
-   // Удаляем оставшиеся объекты по именам, чтобы очистить и графику,
-   // созданную до версии, использующей ObjectsDeleteAll.
-   for(int i = ObjectsTotal(chart_id, -1, -1) - 1; i >= 0; i--)
-     {
-      string name = ObjectName(chart_id, i, -1, -1);
-      if(StringFind(name, prefix) != 0)
-         continue;
-
-      ResetLastError();
-      if(ObjectDelete(chart_id, name))
-         deleted++;
-      else
-         Print("ActeckSmart: не удалось удалить объект ", name,
-               ", err=", GetLastError());
-     }
-
-   ChartRedraw(chart_id);
-   int remaining = 0;
+int CountPrefixedObjects(const long chart_id, const string prefix)
+  {
+   int count = 0;
    for(int i = ObjectsTotal(chart_id, -1, -1) - 1; i >= 0; i--)
      {
       string name = ObjectName(chart_id, i, -1, -1);
       if(StringFind(name, prefix) == 0)
-         remaining++;
+         count++;
      }
+   return count;
+  }
+
+int DeletePrefixedObjects(const long chart_id, const string prefix)
+  {
+   int deleted = 0;
+   for(int pass = 0; pass < 3; pass++)
+     {
+      ResetLastError();
+      int pass_deleted = ObjectsDeleteAll(chart_id, prefix, -1, -1);
+      if(pass_deleted < 0)
+        {
+         Print("ActeckSmart: синхронное удаление объектов с префиксом ",
+               prefix, " не выполнено, err=", GetLastError());
+         break;
+        }
+      deleted += pass_deleted;
+      if(CountPrefixedObjects(chart_id, prefix) == 0)
+         break;
+     }
+   int remaining = CountPrefixedObjects(chart_id, prefix);
+   ChartRedraw(chart_id);
    if(remaining > 0)
       Print("ActeckSmart: после удаления осталось объектов с префиксом ",
             prefix, ": ", remaining);
@@ -668,6 +697,37 @@ public:
       ObjectSetInteger(m_chart, full, OBJPROP_TIME, 1, t2);
       ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 1, p2);
       return true;
+     }
+
+   bool CandleBox(const string name, const datetime t1, const double low,
+                  const datetime t2, const double high, const color clr)
+     {
+      string full = m_prefix + name;
+      ResetLastError();
+      if(ObjectFind(m_chart, full) < 0)
+        {
+         if(!ObjectCreate(m_chart, full, OBJ_RECTANGLE, 0, t1, high, t2, low))
+           {
+            Print("ActeckSmart: не удалось создать рамку потенциального сигнала ",
+                  full, ", err=", GetLastError());
+            return false;
+           }
+        }
+      bool configured = true;
+      configured = ObjectSetInteger(m_chart, full, OBJPROP_COLOR, clr) && configured;
+      configured = ObjectSetInteger(m_chart, full, OBJPROP_STYLE, STYLE_SOLID) && configured;
+      configured = ObjectSetInteger(m_chart, full, OBJPROP_WIDTH, 1) && configured;
+      configured = ObjectSetInteger(m_chart, full, OBJPROP_FILL, false) && configured;
+      configured = ObjectSetInteger(m_chart, full, OBJPROP_BACK, false) && configured;
+      configured = ObjectSetInteger(m_chart, full, OBJPROP_SELECTABLE, false) && configured;
+      configured = ObjectSetInteger(m_chart, full, OBJPROP_TIME, 0, t1) && configured;
+      configured = ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 0, high) && configured;
+      configured = ObjectSetInteger(m_chart, full, OBJPROP_TIME, 1, t2) && configured;
+      configured = ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 1, low) && configured;
+      if(!configured)
+         Print("ActeckSmart: не удалось настроить рамку потенциального сигнала ",
+               full, ", err=", GetLastError());
+      return configured;
      }
 
    bool TextLabel(const string name, datetime t, double price, const string text,
@@ -1385,6 +1445,8 @@ public:
             signal.setup_time = item.time_end;
             signal.direction = item.direction;
             signal.model = model;
+            signal.candle_high = chart_rates[bar].high;
+            signal.candle_low = chart_rates[bar].low;
             signal.entry = entry;
             signal.stop_loss = NormalizeDouble(stop, _Digits);
             signal.take_profit_1 = NormalizeDouble(tp1, _Digits);
@@ -1658,17 +1720,27 @@ public:
       for(int i = 0; i < n; i++)
         {
          SContinued c = m_items[i];
-         if(ShouldDeleteByAge(c.time_start, now_broker))
+         bool expired_by_age = ShouldDeleteByAge(c.time_start, now_broker);
+         bool show_zone = InpShowInterestZones &&
+                          (sniper_hist ? (InpKeepObsoleteZones || !c.obsolete)
+                                       : !c.obsolete);
+         bool keep_fresh_zone = false;
+         if(expired_by_age && show_zone &&
+            IsFreshZoneWithinRetention(c.time_start, now_broker))
+           {
+            double zone_low, zone_high;
+            keep_fresh_zone = (AssessZone(c, rates, total, zone_low, zone_high) ==
+                               ZONE_FRESH);
+           }
+         if(expired_by_age && !keep_fresh_zone)
             continue;
 
          // Sniper сохраняет исторические пунктиры. В режиме v1.1 ими управляют
          // флаг скрытия устаревших СПД и ограничение числа отображаемых линий.
-         const bool hide_lines = !sniper_hist &&
-                                 ((InpHideObsoleteCM && c.obsolete) || (i < first_lines));
+         const bool hide_lines = expired_by_age || (!sniper_hist &&
+                                 ((InpHideObsoleteCM && c.obsolete) || (i < first_lines)));
          // Зона показывается для исторических СПД согласно настройке.
-         const bool show_zone = InpShowInterestZones &&
-                                (sniper_hist ? (InpKeepObsoleteZones || !c.obsolete)
-                                             : !c.obsolete);
+         show_zone = show_zone && (!expired_by_age || keep_fresh_zone);
          color base = (c.direction == DIR_UP) ? InpContUpColor : InpContDownColor;
          color clr  = ApplyFade(base, c.time_start, now_broker);
 
@@ -1709,7 +1781,7 @@ public:
             DrawZone(gfx, i, c, rates, total, now_broker, zt2);
 
          // Курсор: синий вверх / красный вниз + размер в пунктах (как «160.64» в образце)
-         if(InpShowContCursor)
+         if(InpShowContCursor && !expired_by_age)
            {
             gfx.CursorArrow("CM_ARR_" + IntegerToString(i),
                             t_end_pt, c.price_end, c.direction, clr);
@@ -1851,7 +1923,7 @@ bool RecreateRSICanvas(void)
    ObjectSetInteger(0, cname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
    ObjectSetInteger(0, cname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
    ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 22);
+   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, InpRSIPanelYOffset);
    ObjectSetInteger(0, cname, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, cname, OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, cname, OBJPROP_BACK, false);
@@ -1910,7 +1982,7 @@ void UpdateRSIHud(void)
    ObjectSetInteger(0, cname, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
    ObjectSetInteger(0, cname, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
    ObjectSetInteger(0, cname, OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, 22);
+   ObjectSetInteger(0, cname, OBJPROP_YDISTANCE, InpRSIPanelYOffset);
 
    const int pw = InpRSIPanelWidth;
    const int ph = InpRSIPanelHeight;
@@ -2038,6 +2110,19 @@ void DrawTradeSignal(const STradeSignal &signal)
   {
    string key = IntegerToString((long)signal.time);
    color signal_color = (signal.direction == DIR_UP) ? clrDodgerBlue : clrRed;
+   if(InpShowPotentialSignalBoxes)
+     {
+      int bar_seconds = PeriodSeconds((ENUM_TIMEFRAMES)_Period);
+      if(bar_seconds <= 0 || signal.candle_high <= signal.candle_low)
+         Print("ActeckSmart: некорректные границы свечи для рамки сигнала ",
+               key, ", high=", signal.candle_high,
+               ", low=", signal.candle_low, ", timeframe=",
+               EnumToString((ENUM_TIMEFRAMES)_Period));
+      else
+         g_gfx.CandleBox("SG_BOX_" + key, signal.time, signal.candle_low,
+                         signal.time + bar_seconds, signal.candle_high,
+                         signal_color);
+     }
    g_gfx.CursorArrow("SG_A_" + key, signal.time, signal.entry,
                      signal.direction, signal_color);
 
@@ -2210,6 +2295,11 @@ int OnInit()
       Print("ActeckSmart: некорректные параметры сигналов");
       return INIT_PARAMETERS_INCORRECT;
      }
+   if(InpFreshZoneKeepDays < 1 || InpRSIPanelYOffset < 0)
+     {
+      Print("ActeckSmart: срок хранения нетронутых зон должен быть не меньше одного дня, а отступ RSI не может быть отрицательным");
+      return INIT_PARAMETERS_INCORRECT;
+     }
 
    g_gfx.Init(ChartID(), InpPrefix);
    // Удалить артефакты прошлой сессии / старых версий на текущем графике.
@@ -2236,16 +2326,7 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    // 1) Освободить CCanvas (иначе bitmap может «залипнуть»)
-   if(g_rsi_canvas_ok)
-     {
-      g_rsi_canvas.Destroy();
-      g_rsi_canvas_ok = false;
-     }
-   if(g_rsi_handle != INVALID_HANDLE)
-     {
-      IndicatorRelease(g_rsi_handle);
-      g_rsi_handle = INVALID_HANDLE;
-     }
+   DeinitRSIHud();
    if(g_bollinger_handle != INVALID_HANDLE)
      {
       IndicatorRelease(g_bollinger_handle);
