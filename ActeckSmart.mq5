@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.26"
-#property description "ActeckSmart v1.26 — КЗ, модели расширения и сигналы входа"
+#property version   "1.27"
+#property description "ActeckSmart v1.27 — КЗ, модели расширения и сигналы входа"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.26"
+#define AS_VERSION   "1.27"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -86,7 +86,7 @@ input bool   InpKeepObsoleteZones    = true;      // [Sniper] Оставлять
 input int    InpMaxVisibleCM         = 2;         // [v1.1] Макс. видимых ПД (0=все; при SniperStyle игнор.)
 input bool   InpContAlert            = false;     // Алерт появления ПД
 
-input string InpSep7                 = "======== ЗОНЫ ИНТЕРЕСОВ (Fib 38.2%) ========"; // —
+input string InpSep7                 = "======== ЗОНЫ ИНТЕРЕСОВ (38.2% / 23.6%) ========"; // —
 input bool   InpShowInterestZones    = true;      // Показывать зоны покупателей/продавцов
 input color  InpBuyZoneColor         = C'173,216,230'; // Зона покупателей (нежно-голубой)
 input color  InpSellZoneColor        = C'255,182,193'; // Зона продавцов (нежно-розовый)
@@ -95,7 +95,7 @@ input int    InpZoneTouchedAlpha     = 45;        // Непрозрачност�
 input bool   InpZoneHideBroken       = true;      // Не рисовать зоны, пробитые ценой (ликвидность снята)
 input bool   InpZoneShowStateLabel   = true;      // Показывать метку состояния зоны
 input int    InpFreshZoneKeepDays    = 7;         // Сколько дней показывать нетронутую зону
-input double InpFibLevel             = 0.382;     // Уровень Фибоначчи зоны интересов
+input double InpFibLevel             = 0.382;     // Fib базовой модели; каскадная модель — 23.6%
 
 input string InpSepBB                = "======== ПОЛОСЫ БОЛЛИНДЖЕРА (M15) ========"; // —
 input bool   InpShowBollingerLevels  = true;      // Показывать уровни полос Боллинджера
@@ -228,6 +228,7 @@ struct STradeSignal
   {
    datetime time;
    datetime setup_time;
+   datetime liquidity_sweep_time;
    int      structure_index;
    ENUM_DIR direction;
    ENUM_SIGNAL_MODEL model;
@@ -1333,16 +1334,77 @@ public:
       return count;
      }
 
+   bool GetSignalModel(const int structure_index,
+                       ENUM_SIGNAL_MODEL &model) const
+     {
+      if(m_kz == NULL || structure_index <= 0 ||
+         structure_index >= ArraySize(m_items))
+         return false;
+
+      SContinued item = m_items[structure_index];
+      SContinued previous = m_items[structure_index - 1];
+      if(!item.closed || !previous.closed ||
+         previous.time_end >= item.time_start)
+         return false;
+
+      if(previous.direction != item.direction)
+        {
+         model = SIGNAL_MODEL_BASE;
+         return true;
+        }
+
+      if(structure_index < 2 ||
+         CountNewZones(previous.time_end, item.time_end) < 2)
+         return false;
+      bool broke_next_zone =
+         (item.direction == DIR_UP &&
+          item.idx_broken != previous.idx_broken &&
+          item.broken_kz > previous.broken_kz) ||
+         (item.direction == DIR_DOWN &&
+          item.idx_broken != previous.idx_broken &&
+          item.broken_kz < previous.broken_kz);
+      if(!broke_next_zone)
+         return false;
+
+      ENUM_SIGNAL_MODEL previous_model;
+      if(!GetSignalModel(structure_index - 1, previous_model) ||
+         previous_model != SIGNAL_MODEL_BASE)
+         return false;
+
+      model = SIGNAL_MODEL_CASCADE;
+      return true;
+     }
+
+   double FibLevelForModel(const ENUM_SIGNAL_MODEL model) const
+     {
+      return (model == SIGNAL_MODEL_CASCADE) ? 0.236 : InpFibLevel;
+     }
+
    bool GetInterestZoneBounds(const SContinued &item,
+                              const double fib_level,
                               double &zone_low, double &zone_high) const
      {
-      if(InpFibLevel <= 0.0 || InpFibLevel >= 1.0)
+      if(fib_level <= 0.0 || fib_level >= 1.0)
          return false;
       double fib = item.unbroken_kz +
-                   (item.price_break - item.unbroken_kz) * InpFibLevel;
+                   (item.price_break - item.unbroken_kz) * fib_level;
       zone_low = MathMin(item.unbroken_kz, fib);
       zone_high = MathMax(item.unbroken_kz, fib);
       return (zone_high > zone_low);
+     }
+
+   bool GetInterestZoneBoundsForStructure(const int structure_index,
+                                          double &zone_low,
+                                          double &zone_high) const
+     {
+      if(structure_index < 0 || structure_index >= ArraySize(m_items))
+         return false;
+      ENUM_SIGNAL_MODEL model;
+      double fib_level = InpFibLevel;
+      if(GetSignalModel(structure_index, model))
+         fib_level = FibLevelForModel(model);
+      return GetInterestZoneBounds(m_items[structure_index], fib_level,
+                                   zone_low, zone_high);
      }
 
    bool IsSignalWithinZoneRetention(const int structure_index,
@@ -1366,23 +1428,8 @@ public:
          if(!item.closed || item.time_end == 0)
             continue;
 
-         if(i == 0 || !m_items[i - 1].closed)
-            continue;
-
-         SContinued previous = m_items[i - 1];
          ENUM_SIGNAL_MODEL model;
-         // Два однонаправленных движения с двумя новыми КЗ образуют каскад;
-         // противоположные последовательные движения подтверждают базовую модель.
-         if(previous.direction == item.direction &&
-            previous.time_end < item.time_start &&
-            CountNewZones(previous.time_end, item.time_end) >= 2)
-           {
-            model = SIGNAL_MODEL_CASCADE;
-           }
-         else if(previous.direction != item.direction &&
-                 previous.time_end < item.time_start)
-            model = SIGNAL_MODEL_BASE;
-         else
+         if(!GetSignalModel(i, model))
             continue;
 
          if((model == SIGNAL_MODEL_BASE && !InpEnableBaseSignals) ||
@@ -1390,10 +1437,13 @@ public:
             continue;
 
          double zone_low, zone_high;
-         if(!GetInterestZoneBounds(item, zone_low, zone_high))
+         if(!GetInterestZoneBounds(item, FibLevelForModel(model),
+                                   zone_low, zone_high))
             continue;
 
          bool zone_revisited = false;
+         bool liquidity_swept = false;
+         datetime liquidity_sweep_time = 0;
          for(int bar = 0; bar < total; bar++)
            {
             if(chart_rates[bar].time <= item.time_end)
@@ -1421,26 +1471,40 @@ public:
                      : (chart_rates[bar - 1].close > zone_high);
                bool first_retest = (intersects_zone &&
                                     approached_from_expected_side);
-               if(swept_this_bar &&
-                  (!first_retest ||
-                   chart_rates[bar].close < zone_low ||
-                   chart_rates[bar].close > zone_high))
+               if(swept_this_bar && !first_retest)
                   break;
                if(!first_retest)
                   continue;
                zone_revisited = true;
-               if(!swept_this_bar)
-                  continue;
               }
 
-            if(!swept_this_bar)
+            if(!liquidity_swept)
+              {
+               if(!swept_this_bar)
+                  continue;
+               liquidity_swept = true;
+               liquidity_sweep_time = chart_rates[bar].time;
                continue;
-            // После первого выноса зона считается снятой. Сигнал допустим
-            // только на этой же свече, если она закрылась внутри ЗИ.
-            if(!zone_revisited || !intersects_zone ||
-               chart_rates[bar].close < zone_low ||
-               chart_rates[bar].close > zone_high)
-               break;
+              }
+
+            bool impulse_confirmed =
+               (item.direction == DIR_DOWN &&
+                chart_rates[bar].close < chart_rates[bar].open &&
+                chart_rates[bar].close < zone_low) ||
+               (item.direction == DIR_UP &&
+                chart_rates[bar].close > chart_rates[bar].open &&
+                chart_rates[bar].close > zone_high);
+            if(!impulse_confirmed)
+              {
+               bool continuation_confirmed =
+                  (item.direction == DIR_DOWN &&
+                   chart_rates[bar].close > zone_high) ||
+                  (item.direction == DIR_UP &&
+                   chart_rates[bar].close < zone_low);
+               if(continuation_confirmed)
+                  break;
+               continue;
+              }
 
             double entry = chart_rates[bar].close;
             double spread_price = 0.0, spread_percent = 0.0;
@@ -1478,6 +1542,7 @@ public:
             STradeSignal signal;
             signal.time = chart_rates[bar].time;
             signal.setup_time = item.time_end;
+            signal.liquidity_sweep_time = liquidity_sweep_time;
             signal.structure_index = i;
             signal.direction = item.direction;
             signal.model = model;
@@ -1662,12 +1727,13 @@ public:
      }
 
    // Состояние зоны по ликвидности: FRESH / TOUCHED / BROKEN
-   ENUM_ZONE_STATE AssessZone(const SContinued &c, const MqlRates &rates[],
+   ENUM_ZONE_STATE AssessZone(const int structure_index,
+                              const SContinued &c, const MqlRates &rates[],
                               const int total, double &z_lo, double &z_hi,
                               datetime &broken_time) const
      {
       broken_time = 0;
-      if(!GetInterestZoneBounds(c, z_lo, z_hi))
+      if(!GetInterestZoneBoundsForStructure(structure_index, z_lo, z_hi))
          return ZONE_BROKEN;
 
       bool touched = false;
@@ -1675,7 +1741,7 @@ public:
 
       for(int i = 0; i < total; i++)
         {
-         if(rates[i].time < c.time_start)
+         if(rates[i].time <= c.time_end)
             continue;
 
          // касание: бар пересекает полосу зоны
@@ -1720,23 +1786,30 @@ public:
          return false;
       double zone_low, zone_high;
       SContinued item = m_items[signal.structure_index];
-      if(!GetInterestZoneBounds(item, zone_low, zone_high))
+      if(!GetInterestZoneBounds(item, FibLevelForModel(signal.model),
+                                zone_low, zone_high))
          return false;
-      if(signal.entry < zone_low || signal.entry > zone_high)
+      if(signal.liquidity_sweep_time <= item.time_end ||
+         signal.time <= signal.liquidity_sweep_time)
          return false;
-      bool candle_swept_zone =
-         (item.direction == DIR_DOWN && signal.candle_high > zone_high) ||
-         (item.direction == DIR_UP && signal.candle_low < zone_low);
-      if(!candle_swept_zone)
+      bool impulse_confirmed =
+         (item.direction == DIR_DOWN &&
+          signal.direction == DIR_DOWN &&
+          signal.entry < zone_low) ||
+         (item.direction == DIR_UP &&
+          signal.direction == DIR_UP &&
+          signal.entry > zone_high);
+      if(!impulse_confirmed)
          return false;
       int m15_seconds = PeriodSeconds(WORK_TF);
-      int m15_shift = iBarShift(_Symbol, WORK_TF, signal.time, false);
+      int m15_shift = iBarShift(_Symbol, WORK_TF,
+                                signal.liquidity_sweep_time, false);
       if(m15_seconds <= 0 || m15_shift < 0)
          return false;
       datetime m15_bar_time = iTime(_Symbol, WORK_TF, m15_shift);
       return (m15_bar_time >= item.time_start &&
-              signal.time >= m15_bar_time &&
-              signal.time < m15_bar_time + m15_seconds);
+              signal.liquidity_sweep_time >= m15_bar_time &&
+              signal.liquidity_sweep_time < m15_bar_time + m15_seconds);
      }
 
    void DrawZone(CChartObjects &gfx, const int idx, const SContinued &c,
@@ -1750,7 +1823,7 @@ public:
 
       double z_lo, z_hi;
       datetime broken_time;
-      ENUM_ZONE_STATE st = AssessZone(c, rates, total, z_lo, z_hi,
+      ENUM_ZONE_STATE st = AssessZone(idx, c, rates, total, z_lo, z_hi,
                                       broken_time);
       datetime signal_m15_time = 0;
       if(signal_source)
@@ -1789,7 +1862,7 @@ public:
       if(InpZoneShowStateLabel)
         {
          string structure_id = StringFormat("%03d", idx + 1);
-         string state = (signal_source) ? "ВЫНОС ЛИКВИДНОСТИ | СИГНАЛ"
+         string state = (signal_source) ? "ВЫНОС ЛИКВИДНОСТИ | ИМПУЛЬС"
                         : ((st == ZONE_FRESH) ? "НЕ ТРОНУТА"
                            : ((st == ZONE_TOUCHED) ? "КАСАНИЕ" : "ПРОБИТА"));
          string spd_period = "(от " + FormatDateTimeISO(c.time_start) +
@@ -1826,7 +1899,7 @@ public:
             continue;
          SContinued item = m_items[structure_index];
          DrawZone(gfx, structure_index, item, rates, total, now_broker,
-                  zt2, true, signals[i].time);
+                  zt2, true, signals[i].liquidity_sweep_time);
         }
      }
 
@@ -1856,8 +1929,9 @@ public:
            {
             double zone_low, zone_high;
             datetime ignored_broken_time;
-            keep_fresh_zone = (AssessZone(c, rates, total, zone_low, zone_high,
-                                          ignored_broken_time) == ZONE_FRESH);
+            keep_fresh_zone = (AssessZone(i, c, rates, total, zone_low,
+                                          zone_high, ignored_broken_time) ==
+                               ZONE_FRESH);
            }
          if(expired_by_age && !keep_fresh_zone)
             continue;
