@@ -17,6 +17,9 @@
 *.tmp
 *~
 
+# Local diagnostic screenshot; keep it out of the repository
+/screenshots/Зоны для сигналов.png
+
 # Optional local notes
 .env
 .idea/

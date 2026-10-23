@@ -4,8 +4,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.28"
-#property description "Советник Safe для ActeckSmart; автоторговля выключена по умолчанию"
+#property version   "1.40"
+#property description "Советник Safe и мульти-сделки ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
 
@@ -15,7 +15,10 @@ input int    InpMaximumLeverage        = 33;
 input double InpExecutionCostReservePct = 10.0;
 input ulong  InpMagicNumber            = 181001;
 input int    InpMaxSlippagePoints      = 20;
-input double InpFreeMarginReservePct = 10.0;
+input double InpFreeMarginReservePct  = 10.0;
+input int    InpMultiOrderCount        = 2;
+input double InpMultiLot               = 0.01;
+input double InpMultiStopLossPoints    = 10.0;
 
 enum ENUM_SIGNAL_MODEL
   {
@@ -33,7 +36,23 @@ double g_netting_tp2 = 0.0;
 double g_netting_leg_volume = 0.0;
 bool g_netting_tp1_done = false;
 bool g_netting_state_available = false;
+bool g_signal_lookup_warned = false;
 string g_netting_state_prefix;
+
+string g_multi_panel_prefix = "AS_MULTI_";
+string g_multi_buy_button = "AS_MULTI_BUY";
+string g_multi_sell_button = "AS_MULTI_SELL";
+string g_multi_lot_edit = "AS_MULTI_LOT";
+string g_multi_stop_edit = "AS_MULTI_STOP";
+string g_multi_lot_decrease = "AS_MULTI_LOT_MINUS";
+string g_multi_lot_increase = "AS_MULTI_LOT_PLUS";
+string g_multi_stop_decrease = "AS_MULTI_STOP_MINUS";
+string g_multi_stop_increase = "AS_MULTI_STOP_PLUS";
+string g_multi_toggle_button = "AS_MULTI_TOGGLE";
+double g_multi_last_valid_lot = 0.01;
+double g_multi_last_valid_stop = 10.0;
+bool g_multi_panel_expanded = true;
+int g_multi_panel_hidden_offset = 10000;
 
 int VolumeDigits(const double step)
   {
@@ -70,6 +89,27 @@ bool IsTradeRetcodeSuccessful(void)
   {
    uint code = g_trade.ResultRetcode();
    return (code == TRADE_RETCODE_DONE || code == TRADE_RETCODE_DONE_PARTIAL);
+  }
+
+bool EnsureSignalHandle(void)
+  {
+   if(g_signal_handle != INVALID_HANDLE)
+      return true;
+   ResetLastError();
+   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.28");
+   if(g_signal_handle != INVALID_HANDLE)
+     {
+      g_signal_lookup_warned = false;
+      Print("ActeckSmart Trader: подключён индикатор ActeckSmart v1.28");
+      return true;
+     }
+   if(!g_signal_lookup_warned)
+     {
+      Print("ActeckSmart Trader: индикатор ActeckSmart v1.28 не найден на графике; панель MULTI доступна, автосигналы ожидают индикатор, err=",
+            GetLastError());
+      g_signal_lookup_warned = true;
+     }
+   return false;
   }
 
 bool ReadSignal(const datetime signal_bar, double &direction, double &entry,
@@ -801,24 +841,596 @@ bool ExecuteSignal(const double direction, const double signal_entry,
    return true;
   }
 
+bool CreateMultiPanelButton(const string name, const string caption,
+                            const int x_distance, const int y_distance,
+                            const int width, const int height,
+                            const color background)
+  {
+   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
+      return false;
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x_distance);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y_distance);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, background);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, background);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);
+   ObjectSetInteger(0, name, OBJPROP_STATE, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 10);
+   ObjectSetString(0, name, OBJPROP_TEXT, caption);
+   return true;
+  }
+
+bool CreateMultiPanelEdit(const string name, const string initial_text,
+                          const int x_distance, const int y_distance,
+                          const int width)
+  {
+   if(!ObjectCreate(0, name, OBJ_EDIT, 0, 0, 0))
+      return false;
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x_distance);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y_distance);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, 30);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, C'35,48,62');
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, C'190,201,213');
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 11);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, name, OBJPROP_ALIGN, ALIGN_CENTER);
+   ObjectSetInteger(0, name, OBJPROP_READONLY, false);
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 30);
+   ObjectSetString(0, name, OBJPROP_TEXT, initial_text);
+   return true;
+  }
+
+bool CreateMultiPanelLabel(const string name, const string caption,
+                           const int x_distance, const int y_distance,
+                           const color text_color, const int font_size)
+  {
+   if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+      return false;
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x_distance);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y_distance);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, text_color);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, font_size);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 1);
+   ObjectSetString(0, name, OBJPROP_TEXT, caption);
+   return true;
+  }
+
+void DeleteMultiPanel(void)
+  {
+   ObjectDelete(0, g_multi_buy_button);
+   ObjectDelete(0, g_multi_sell_button);
+   ObjectDelete(0, g_multi_lot_decrease);
+   ObjectDelete(0, g_multi_lot_increase);
+   ObjectDelete(0, g_multi_stop_decrease);
+   ObjectDelete(0, g_multi_stop_increase);
+   ObjectDelete(0, g_multi_toggle_button);
+   ObjectDelete(0, g_multi_lot_edit);
+   ObjectDelete(0, g_multi_stop_edit);
+   ObjectDelete(0, g_multi_panel_prefix + "BG");
+   ObjectDelete(0, g_multi_panel_prefix + "HEADER");
+   ObjectDelete(0, g_multi_panel_prefix + "LOT_LABEL");
+   ObjectDelete(0, g_multi_panel_prefix + "SL_LABEL");
+   ObjectDelete(0, g_multi_panel_prefix + "ACCENT");
+   ChartRedraw(0);
+  }
+
+bool CreateMultiPanel(void)
+  {
+   string background = g_multi_panel_prefix + "BG";
+   color panel_fill = C'246,248,251';
+   if(!ObjectCreate(0, background, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+     {
+      Print("ActeckSmart Trader: не удалось создать фон панели MULTI, err=",
+            GetLastError());
+      return false;
+     }
+   ObjectSetInteger(0, background, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, background, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, background, OBJPROP_YDISTANCE, 190);
+   ObjectSetInteger(0, background, OBJPROP_XSIZE, 420);
+   ObjectSetInteger(0, background, OBJPROP_YSIZE, 184);
+   ObjectSetInteger(0, background, OBJPROP_BGCOLOR, panel_fill);
+   ObjectSetInteger(0, background, OBJPROP_COLOR, C'204,213,223');
+   ObjectSetInteger(0, background, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, background, OBJPROP_BACK, false);
+   ObjectSetInteger(0, background, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, background, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, background, OBJPROP_ZORDER, 0);
+
+   string accent = g_multi_panel_prefix + "ACCENT";
+   if(!ObjectCreate(0, accent, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+     {
+      Print("ActeckSmart Trader: не удалось создать акцент панели MULTI, err=",
+            GetLastError());
+      DeleteMultiPanel();
+      return false;
+     }
+   ObjectSetInteger(0, accent, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, accent, OBJPROP_XDISTANCE, 11);
+   ObjectSetInteger(0, accent, OBJPROP_YDISTANCE, 199);
+   ObjectSetInteger(0, accent, OBJPROP_XSIZE, 3);
+   ObjectSetInteger(0, accent, OBJPROP_YSIZE, 142);
+   ObjectSetInteger(0, accent, OBJPROP_BGCOLOR, C'43,119,190');
+   ObjectSetInteger(0, accent, OBJPROP_COLOR, C'43,119,190');
+   ObjectSetInteger(0, accent, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, accent, OBJPROP_BACK, false);
+   ObjectSetInteger(0, accent, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, accent, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, accent, OBJPROP_ZORDER, 1);
+
+   bool created =
+      CreateMultiPanelLabel(g_multi_panel_prefix + "HEADER",
+                            "MULTI-TRADE  |  ACTECKSMART",
+                            28, 198, C'39,58,79', 9) &&
+      CreateMultiPanelButton(g_multi_toggle_button, "−", 390, 198, 24, 20,
+                             C'108,124,141') &&
+      CreateMultiPanelLabel(g_multi_panel_prefix + "LOT_LABEL",
+                            "LOT / ORDER", 28, 234, C'91,106,122', 8) &&
+      CreateMultiPanelEdit(g_multi_lot_edit, DoubleToString(InpMultiLot, 2),
+                           28, 260, 102) &&
+      CreateMultiPanelButton(g_multi_lot_increase, "▲", 135, 260, 24, 14,
+                             C'108,124,141') &&
+      CreateMultiPanelButton(g_multi_lot_decrease, "▼", 135, 276, 24, 14,
+                             C'108,124,141') &&
+      CreateMultiPanelLabel(g_multi_panel_prefix + "SL_LABEL",
+                            "SL / POINTS", 224, 234,
+                            C'91,106,122', 8) &&
+      CreateMultiPanelEdit(g_multi_stop_edit,
+                           DoubleToString(InpMultiStopLossPoints, 2),
+                           224, 260, 102) &&
+      CreateMultiPanelButton(g_multi_stop_increase, "▲", 331, 260, 24, 14,
+                             C'108,124,141') &&
+      CreateMultiPanelButton(g_multi_stop_decrease, "▼", 331, 276, 24, 14,
+                             C'108,124,141') &&
+      CreateMultiPanelButton(g_multi_buy_button,
+                             StringFormat("BUY x%d",
+                                          InpMultiOrderCount),
+                             28, 318, 180, 30, C'35,119,190') &&
+      CreateMultiPanelButton(g_multi_sell_button,
+                             StringFormat("SELL x%d",
+                                          InpMultiOrderCount),
+                             216, 318, 180, 30, C'194,77,83');
+   if(!created)
+     {
+      Print("ActeckSmart Trader: не удалось создать панель MULTI, err=",
+            GetLastError());
+      DeleteMultiPanel();
+      return false;
+     }
+   g_multi_last_valid_lot = InpMultiLot;
+   g_multi_last_valid_stop = InpMultiStopLossPoints;
+   ChartRedraw(0);
+   Print("ActeckSmart Trader: панель MULTI создана в левом верхнем углу, под стандартной панелью One Click");
+   return true;
+  }
+
+bool ReadPositivePanelNumber(const string object_name, double &value)
+  {
+   string text = ObjectGetString(0, object_name, OBJPROP_TEXT);
+   StringTrimLeft(text);
+   StringTrimRight(text);
+   StringReplace(text, ",", ".");
+   int length = StringLen(text);
+   bool has_digit = false;
+   bool has_decimal = false;
+   for(int i = 0; i < length; i++)
+     {
+      ushort character = StringGetCharacter(text, i);
+      if(character >= '0' && character <= '9')
+         has_digit = true;
+      else if(character == '.' && !has_decimal)
+         has_decimal = true;
+      else
+         return false;
+     }
+   if(!has_digit)
+      return false;
+   value = StringToDouble(text);
+   return (MathIsValidNumber(value) && value > 0.0);
+  }
+
+bool IsMultiLotValid(const double lot)
+  {
+   double minimum = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maximum = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(minimum <= 0.0 || maximum <= 0.0 || step <= 0.0 ||
+      lot < minimum - 1e-9 || lot > maximum + 1e-9)
+      return false;
+
+   double broker_steps = lot / step;
+   double hundredth_steps = lot / 0.01;
+   return (MathAbs(broker_steps - MathRound(broker_steps)) < 1e-7 &&
+           MathAbs(hundredth_steps - MathRound(hundredth_steps)) < 1e-7);
+  }
+
+void AdjustMultiLot(const int step_direction)
+  {
+   double current_lot = 0.0;
+   if(!ReadPositivePanelNumber(g_multi_lot_edit, current_lot) ||
+      !IsMultiLotValid(current_lot))
+      return;
+
+   double new_lot = NormalizeDouble(current_lot + step_direction * 0.01, 2);
+   if(!IsMultiLotValid(new_lot))
+      return;
+   ObjectSetString(0, g_multi_lot_edit, OBJPROP_TEXT,
+                   DoubleToString(new_lot, 2));
+   g_multi_last_valid_lot = new_lot;
+   ChartRedraw(0);
+  }
+
+void AdjustMultiStopLoss(const int step_direction)
+  {
+   double current_points = 0.0;
+   if(!ReadPositivePanelNumber(g_multi_stop_edit, current_points) ||
+      current_points > 1000000.0)
+     {
+      Alert("ActeckSmart Trader: сначала укажите положительную дистанцию SL");
+      return;
+     }
+
+   double new_points = NormalizeDouble(current_points + step_direction, 2);
+   if(new_points <= 0.0 || new_points > 1000000.0)
+     {
+      Alert("ActeckSmart Trader: дистанция SL должна быть больше 0 и не превышать 1000000 пунктов");
+      return;
+     }
+   ObjectSetString(0, g_multi_stop_edit, OBJPROP_TEXT,
+                   DoubleToString(new_points, 2));
+   g_multi_last_valid_stop = new_points;
+   ChartRedraw(0);
+  }
+
+void SetMultiPanelExpanded(const bool expanded)
+  {
+   if(g_multi_panel_expanded == expanded)
+      return;
+
+   string content_objects[] =
+     {
+      g_multi_buy_button,
+      g_multi_sell_button,
+      g_multi_lot_decrease,
+      g_multi_lot_increase,
+      g_multi_stop_decrease,
+      g_multi_stop_increase,
+      g_multi_lot_edit,
+      g_multi_stop_edit,
+      g_multi_panel_prefix + "LOT_LABEL",
+      g_multi_panel_prefix + "SL_LABEL"
+     };
+   int offset = expanded ? -g_multi_panel_hidden_offset
+                         : g_multi_panel_hidden_offset;
+   for(int i = 0; i < ArraySize(content_objects); i++)
+     {
+      if(ObjectFind(0, content_objects[i]) < 0)
+         continue;
+      long x_distance = ObjectGetInteger(0, content_objects[i],
+                                         OBJPROP_XDISTANCE);
+      ObjectSetInteger(0, content_objects[i], OBJPROP_XDISTANCE,
+                       x_distance + offset);
+     }
+
+   ObjectSetInteger(0, g_multi_panel_prefix + "BG", OBJPROP_YSIZE,
+                    expanded ? 184 : 38);
+   ObjectSetInteger(0, g_multi_panel_prefix + "ACCENT", OBJPROP_YSIZE,
+                    expanded ? 142 : 22);
+   ObjectSetString(0, g_multi_toggle_button, OBJPROP_TEXT,
+                   expanded ? "−" : "+");
+   ObjectSetInteger(0, g_multi_toggle_button, OBJPROP_STATE, false);
+   g_multi_panel_expanded = expanded;
+   ChartRedraw(0);
+  }
+
+double MultiSpecificationPointPrice(void)
+  {
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(point <= 0.0)
+      return 0.0;
+
+   long digits = SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   string base_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
+   string profit_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
+   if(StringLen(base_currency) == 3 && StringLen(profit_currency) == 3 &&
+      (digits == 3 || digits == 5))
+      return point * 10.0;
+
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   return (tick_size > 0.0) ? tick_size : point;
+  }
+
+bool ValidateMultiLevels(const ENUM_ORDER_TYPE order_type,
+                         const double stop, const double take_profit)
+  {
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick) || tick.bid <= 0.0 || tick.ask <= 0.0)
+      return false;
+   double minimum_distance = SymbolInfoInteger(_Symbol,
+                                               SYMBOL_TRADE_STOPS_LEVEL) *
+                             _Point;
+   if(order_type == ORDER_TYPE_BUY)
+      return (stop < tick.bid - minimum_distance &&
+              take_profit > tick.bid + minimum_distance);
+   return (stop > tick.ask + minimum_distance &&
+           take_profit < tick.ask - minimum_distance);
+  }
+
+bool OpenMultiPosition(const ENUM_ORDER_TYPE order_type, const double volume,
+                       const double common_stop, const double reward_ratio,
+                       const int position_number, ulong &position_ticket)
+  {
+   position_ticket = 0;
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+   double quote_entry = (order_type == ORDER_TYPE_BUY) ? tick.ask : tick.bid;
+   double initial_risk = MathAbs(quote_entry - common_stop);
+   double provisional_tp = SafeLevelPrice(order_type, quote_entry,
+                                          initial_risk * reward_ratio, false);
+   if(!ValidateMultiLevels(order_type, common_stop, provisional_tp))
+     {
+      Print("ActeckSmart Trader: SL/TP слишком близки к рынку для ограничений брокера");
+      return false;
+     }
+
+   string comment = StringFormat("Acteck Multi %d", position_number);
+   bool sent = (order_type == ORDER_TYPE_BUY)
+               ? g_trade.Buy(volume, _Symbol, 0.0, common_stop,
+                             provisional_tp, comment)
+               : g_trade.Sell(volume, _Symbol, 0.0, common_stop,
+                              provisional_tp, comment);
+   if(!sent || !IsTradeRetcodeSuccessful())
+     {
+      Print("ActeckSmart Trader: не удалось открыть MULTI-позицию ",
+            position_number, ": ", g_trade.ResultRetcodeDescription());
+      return false;
+     }
+
+   if(g_trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL)
+     {
+      double partial_fill = 0.0;
+      ulong partial_ticket = 0;
+      if(GetFillPriceAndPosition(g_trade.ResultDeal(), partial_fill,
+                                 partial_ticket))
+        {
+         if(!CloseHedgingPositionFully(partial_ticket))
+            Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть частично исполненную MULTI-позицию, ticket ",
+                  partial_ticket);
+        }
+      else
+         Alert("ActeckSmart Trader: КРИТИЧНО — частичное исполнение MULTI; проверьте позицию вручную");
+      return false;
+     }
+
+   double fill_price = 0.0;
+   if(!GetFillPriceAndPosition(g_trade.ResultDeal(), fill_price,
+                               position_ticket))
+     {
+      Alert("ActeckSmart Trader: ордер MULTI исполнен, но ticket позиции не определён; проверьте её вручную");
+      return false;
+     }
+
+   double actual_risk = MathAbs(fill_price - common_stop);
+   double final_tp = SafeLevelPrice(order_type, fill_price,
+                                    actual_risk * reward_ratio, false);
+   if(!ValidateMultiLevels(order_type, common_stop, final_tp))
+     {
+      Print("ActeckSmart Trader: после исполнения цены не соответствуют ограничениям SL/TP");
+      if(!CloseHedgingPositionFully(position_ticket))
+         Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть MULTI-позицию с недопустимым TP, ticket ",
+               position_ticket);
+      return false;
+     }
+   bool modification_sent =
+      g_trade.PositionModify(position_ticket, common_stop, final_tp);
+   uint modification_retcode = g_trade.ResultRetcode();
+   bool modification_succeeded =
+      (modification_sent && modification_retcode == TRADE_RETCODE_DONE) ||
+      modification_retcode == TRADE_RETCODE_NO_CHANGES;
+   if(!modification_succeeded)
+     {
+      Print("ActeckSmart Trader: не удалось установить TP по фактическому fill: ",
+            g_trade.ResultRetcodeDescription());
+      if(!CloseHedgingPositionFully(position_ticket))
+         Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть MULTI-позицию после ошибки установки TP, ticket ",
+               position_ticket);
+      return false;
+     }
+   return true;
+  }
+
+bool ExecuteMultiTrade(const ENUM_ORDER_TYPE order_type)
+  {
+   if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) !=
+      ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+     {
+      Alert("ActeckSmart Trader: MULTI BUY/SELL доступны только на Hedging-счёте");
+      return false;
+     }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ||
+      !MQLInfoInteger(MQL_TRADE_ALLOWED) ||
+      !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+     {
+      Alert("ActeckSmart Trader: торговля запрещена настройками терминала, эксперта или счёта");
+      return false;
+     }
+
+   double lot = 0.0;
+   double stop_loss_points = 0.0;
+   if(!ReadPositivePanelNumber(g_multi_lot_edit, lot) ||
+      !IsMultiLotValid(lot))
+     {
+      Alert("ActeckSmart Trader: лот должен быть не меньше минимума символа и соответствовать шагу 0.01 и шагу брокера");
+      return false;
+     }
+   if(!ReadPositivePanelNumber(g_multi_stop_edit, stop_loss_points) ||
+      stop_loss_points > 1000000.0)
+     {
+      Alert("ActeckSmart Trader: в поле SL укажите положительную дистанцию в пунктах");
+      return false;
+     }
+
+   ENUM_SYMBOL_TRADE_MODE trade_mode =
+      (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+   if(trade_mode == SYMBOL_TRADE_MODE_DISABLED ||
+      trade_mode == SYMBOL_TRADE_MODE_CLOSEONLY ||
+      (order_type == ORDER_TYPE_BUY &&
+       trade_mode == SYMBOL_TRADE_MODE_SHORTONLY) ||
+      (order_type == ORDER_TYPE_SELL &&
+       trade_mode == SYMBOL_TRADE_MODE_LONGONLY))
+     {
+      Alert("ActeckSmart Trader: направление MULTI-сделки запрещено для символа");
+      return false;
+     }
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick) || tick.bid <= 0.0 || tick.ask <= 0.0)
+     {
+      Alert("ActeckSmart Trader: не удалось получить текущие Bid/Ask");
+      return false;
+     }
+   double specification_point = MultiSpecificationPointPrice();
+   if(specification_point <= 0.0)
+     {
+      Alert("ActeckSmart Trader: не удалось определить размер пункта символа");
+      return false;
+     }
+
+   double entry = (order_type == ORDER_TYPE_BUY) ? tick.ask : tick.bid;
+   double spread = MathMax(0.0, tick.ask - tick.bid);
+   double stop_distance = stop_loss_points * specification_point + spread;
+   double common_stop = SafeLevelPrice(order_type, entry, stop_distance, true);
+   ulong first_ticket = 0;
+   if(!OpenMultiPosition(order_type, lot, common_stop, 1.0, 1,
+                         first_ticket))
+      return false;
+
+   if(InpMultiOrderCount == 1)
+     {
+      Print("ActeckSmart Trader: MULTI позиция открыта, ticket=",
+            first_ticket, ", volume=", DoubleToString(lot, 2),
+            ", SL=", DoubleToString(common_stop, _Digits), ", RR=1:1");
+      return true;
+     }
+
+   ulong second_ticket = 0;
+   if(!OpenMultiPosition(order_type, lot, common_stop, 2.0, 2,
+                         second_ticket))
+     {
+      if(!CloseHedgingPositionFully(first_ticket))
+         Alert("ActeckSmart Trader: КРИТИЧНО — второй MULTI-ордер не открыт, первый не удалось закрыть. Ticket ",
+               first_ticket);
+      return false;
+     }
+
+   Print("ActeckSmart Trader: MULTI ",
+         (order_type == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+         " открыт: count=", InpMultiOrderCount,
+         ", volume/order=", DoubleToString(lot, 2),
+         ", common SL=", DoubleToString(common_stop, _Digits),
+         ", TP1=1:1, TP2=1:2, tickets=", first_ticket, "/", second_ticket);
+   return true;
+  }
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam,
+                  const string &sparam)
+  {
+   if(id == CHARTEVENT_OBJECT_ENDEDIT &&
+      (sparam == g_multi_lot_edit || sparam == g_multi_stop_edit))
+     {
+      double value = 0.0;
+      if(!ReadPositivePanelNumber(sparam, value) ||
+         (sparam == g_multi_lot_edit && !IsMultiLotValid(value)) ||
+         (sparam == g_multi_stop_edit && value > 1000000.0))
+        {
+         double last_valid = (sparam == g_multi_lot_edit)
+                             ? g_multi_last_valid_lot
+                             : g_multi_last_valid_stop;
+         ObjectSetString(0, sparam, OBJPROP_TEXT,
+                         DoubleToString(last_valid, 2));
+         ChartRedraw(0);
+         return;
+        }
+      ObjectSetString(0, sparam, OBJPROP_TEXT,
+                      DoubleToString(value, 2));
+      if(sparam == g_multi_lot_edit)
+         g_multi_last_valid_lot = value;
+      else
+         g_multi_last_valid_stop = value;
+      ChartRedraw(0);
+      return;
+     }
+
+   if(id != CHARTEVENT_OBJECT_CLICK)
+      return;
+   if(sparam == g_multi_toggle_button)
+     {
+      SetMultiPanelExpanded(!g_multi_panel_expanded);
+     }
+   else if(sparam == g_multi_lot_decrease)
+     {
+      ObjectSetInteger(0, g_multi_lot_decrease, OBJPROP_STATE, false);
+      AdjustMultiLot(-1);
+     }
+   else if(sparam == g_multi_lot_increase)
+     {
+      ObjectSetInteger(0, g_multi_lot_increase, OBJPROP_STATE, false);
+      AdjustMultiLot(1);
+     }
+   else if(sparam == g_multi_stop_decrease)
+     {
+      ObjectSetInteger(0, g_multi_stop_decrease, OBJPROP_STATE, false);
+      AdjustMultiStopLoss(-1);
+     }
+   else if(sparam == g_multi_stop_increase)
+     {
+      ObjectSetInteger(0, g_multi_stop_increase, OBJPROP_STATE, false);
+      AdjustMultiStopLoss(1);
+     }
+   else if(sparam == g_multi_buy_button)
+     {
+      ObjectSetInteger(0, g_multi_buy_button, OBJPROP_STATE, false);
+      ExecuteMultiTrade(ORDER_TYPE_BUY);
+     }
+   else if(sparam == g_multi_sell_button)
+     {
+      ObjectSetInteger(0, g_multi_sell_button, OBJPROP_STATE, false);
+      ExecuteMultiTrade(ORDER_TYPE_SELL);
+     }
+  }
+
 int OnInit()
   {
    if(InpRiskPercent <= 0.0 || InpRiskPercent > 2.0 ||
       InpMaximumLeverage < 1 || InpMaxSlippagePoints < 0 ||
       InpMagicNumber == 0 ||
       InpExecutionCostReservePct < 0.0 || InpExecutionCostReservePct >= 100.0 ||
-      InpFreeMarginReservePct < 0.0 || InpFreeMarginReservePct >= 100.0)
+      InpFreeMarginReservePct < 0.0 || InpFreeMarginReservePct >= 100.0 ||
+      InpMultiOrderCount < 1 || InpMultiOrderCount > 2 ||
+      InpMultiLot <= 0.0 || InpMultiStopLossPoints <= 0.0)
      {
-      Print("ActeckSmart Trader: неверные параметры риска/плеча/резерва маржи");
+      Print("ActeckSmart Trader: неверные параметры риска, маржи или MULTI-панели");
       return INIT_PARAMETERS_INCORRECT;
-     }
-
-   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.28");
-   if(g_signal_handle == INVALID_HANDLE)
-     {
-      Print("ActeckSmart Trader: прикрепите ActeckSmart v1.28 к основному окну этого графика до запуска советника, err=",
-            GetLastError());
-      return INIT_FAILED;
      }
 
    g_trade.SetExpertMagicNumber(InpMagicNumber);
@@ -830,11 +1442,15 @@ int OnInit()
                                          StringSubstr(_Symbol, 0, 12));
    g_last_processed_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 1);
    LoadNettingState();
+   if(!CreateMultiPanel())
+      return INIT_FAILED;
+   EnsureSignalHandle();
    return INIT_SUCCEEDED;
   }
 
 void OnDeinit(const int reason)
   {
+   DeleteMultiPanel();
    g_signal_handle = INVALID_HANDLE;
   }
 
@@ -844,6 +1460,8 @@ void OnTick()
       (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
    if(account_mode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
       ManageNettingPosition();
+   if(!EnsureSignalHandle())
+      return;
 
    datetime closed_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 1);
    if(closed_bar == 0 || closed_bar == g_last_processed_bar)
