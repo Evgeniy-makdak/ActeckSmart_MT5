@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.27"
-#property description "ActeckSmart v1.27 — КЗ, модели расширения и сигналы входа"
+#property version   "1.28"
+#property description "ActeckSmart v1.28 — настраиваемый ТФ структур"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.27"
+#define AS_VERSION   "1.28"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -24,7 +24,8 @@
 //| Входные параметры                                                |
 //+------------------------------------------------------------------+
 input string InpSep0                 = "======== ОБЩИЕ ========"; // —
-input int    InpHistoryBars          = 1500;      // Глубина истории M15 (баров)
+input ENUM_TIMEFRAMES InpStructureTimeframe = PERIOD_M15; // Таймфрейм структур; PERIOD_CURRENT = таймфрейм графика
+input int    InpHistoryBars          = 1500;      // Глубина истории структурного ТФ (баров)
 input int    InpBrokerGMTOffset      = 3;         // Сдвиг времени брокера относительно GMT (часы)
 input bool   InpKeepHistory          = false;     // KeepHistory: не затухать и не удалять разметку
 input int    InpFadeDays1            = 1;         // Через N дней объекты тускнеют
@@ -140,8 +141,6 @@ input string InpPrefix               = "AS_";     // Префикс графич
 //+------------------------------------------------------------------+
 //| Константы и перечисления                                         |
 //+------------------------------------------------------------------+
-#define WORK_TF PERIOD_M15
-
 enum ENUM_SIGNAL_MODEL
   {
    SIGNAL_MODEL_BASE = 1,
@@ -171,6 +170,12 @@ enum ENUM_DIR
    DIR_UP,
    DIR_DOWN
   };
+
+ENUM_TIMEFRAMES StructureTimeframe(void)
+  {
+   return (InpStructureTimeframe == PERIOD_CURRENT)
+          ? (ENUM_TIMEFRAMES)_Period : InpStructureTimeframe;
+  }
 
 enum ENUM_ZONE_STATE
   {
@@ -1230,7 +1235,10 @@ public:
       if(!InpShowKZ)
          return;
 
-      datetime last_time = (total > 0) ? rates[total - 1].time + PeriodSeconds(WORK_TF) : TimeCurrent();
+      datetime last_time = (total > 0)
+                           ? rates[total - 1].time +
+                             PeriodSeconds(StructureTimeframe())
+                           : TimeCurrent();
       double point_off = InpKZLabelOffsetPoints * _Point;
 
       int kz_n = ArraySize(m_kz);
@@ -1801,15 +1809,18 @@ public:
           signal.entry > zone_high);
       if(!impulse_confirmed)
          return false;
-      int m15_seconds = PeriodSeconds(WORK_TF);
-      int m15_shift = iBarShift(_Symbol, WORK_TF,
-                                signal.liquidity_sweep_time, false);
-      if(m15_seconds <= 0 || m15_shift < 0)
+      ENUM_TIMEFRAMES structure_tf = StructureTimeframe();
+      int structure_seconds = PeriodSeconds(structure_tf);
+      int structure_shift = iBarShift(_Symbol, structure_tf,
+                                      signal.liquidity_sweep_time, false);
+      if(structure_seconds <= 0 || structure_shift < 0)
          return false;
-      datetime m15_bar_time = iTime(_Symbol, WORK_TF, m15_shift);
-      return (m15_bar_time >= item.time_start &&
-              signal.liquidity_sweep_time >= m15_bar_time &&
-              signal.liquidity_sweep_time < m15_bar_time + m15_seconds);
+      datetime structure_bar_time = iTime(_Symbol, structure_tf,
+                                          structure_shift);
+      return (structure_bar_time >= item.time_start &&
+              signal.liquidity_sweep_time >= structure_bar_time &&
+              signal.liquidity_sweep_time <
+              structure_bar_time + structure_seconds);
      }
 
    void DrawZone(CChartObjects &gfx, const int idx, const SContinued &c,
@@ -1825,16 +1836,20 @@ public:
       datetime broken_time;
       ENUM_ZONE_STATE st = AssessZone(idx, c, rates, total, z_lo, z_hi,
                                       broken_time);
-      datetime signal_m15_time = 0;
+      datetime signal_structure_time = 0;
       if(signal_source)
         {
-         int m15_shift = iBarShift(_Symbol, WORK_TF, signal_time, false);
-         if(m15_shift < 0)
+         ENUM_TIMEFRAMES structure_tf = StructureTimeframe();
+         int structure_shift = iBarShift(_Symbol, structure_tf,
+                                         signal_time, false);
+         if(structure_shift < 0)
             return;
-         signal_m15_time = iTime(_Symbol, WORK_TF, m15_shift);
-         if(signal_m15_time == 0 ||
-            signal_time < signal_m15_time ||
-            signal_time >= signal_m15_time + PeriodSeconds(WORK_TF))
+         signal_structure_time = iTime(_Symbol, structure_tf,
+                                       structure_shift);
+         if(signal_structure_time == 0 ||
+            signal_time < signal_structure_time ||
+            signal_time >= signal_structure_time +
+                           PeriodSeconds(structure_tf))
             return;
          st = ZONE_BROKEN;
         }
@@ -1848,9 +1863,10 @@ public:
       int za = (st == ZONE_FRESH) ? InpZoneAlpha : InpZoneTouchedAlpha;
       datetime zone_end = zt2;
       if(signal_source)
-         zone_end = signal_m15_time + PeriodSeconds(WORK_TF);
+         zone_end = signal_structure_time +
+                    PeriodSeconds(StructureTimeframe());
       else if(st == ZONE_BROKEN && broken_time != 0 && broken_time < zone_end)
-         zone_end = broken_time + PeriodSeconds(WORK_TF);
+         zone_end = broken_time + PeriodSeconds(StructureTimeframe());
       if(zone_end <= c.time_start)
          return;
       if(signal_source && (signal_time < c.time_start || signal_time >= zone_end))
@@ -1873,7 +1889,8 @@ public:
                  " | СПД " + spd_period;
          datetime label_time = signal_source
                                ? signal_time
-                               : zone_end - PeriodSeconds(WORK_TF) * 4;
+                               : zone_end -
+                                 PeriodSeconds(StructureTimeframe()) * 4;
          if(label_time < c.time_start)
             label_time = c.time_start;
          double label_price = (z_lo + z_hi) * 0.5;
@@ -1891,7 +1908,8 @@ public:
      {
       if(!InpShowInterestZones || total <= 0)
          return;
-      datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
+      datetime zt2 = rates[total - 1].time +
+                     PeriodSeconds(StructureTimeframe()) * 8;
       for(int i = 0; i < ArraySize(signals); i++)
         {
          int structure_index = signals[i].structure_index;
@@ -1947,12 +1965,16 @@ public:
 
          datetime t_end_pt = (c.end_bar >= 0 && c.end_bar < total) ? rates[c.end_bar].time
                             : ((c.time_end != 0) ? c.time_end : rates[total - 1].time);
-         datetime chart_end = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
+         datetime chart_end = rates[total - 1].time +
+                              PeriodSeconds(StructureTimeframe()) * 8;
          datetime t_h_end  = c.closed ? c.time_end
-                                      : rates[total - 1].time + PeriodSeconds(WORK_TF);
+                                      : rates[total - 1].time +
+                                        PeriodSeconds(StructureTimeframe());
          if(t_h_end <= c.time_start)
-            t_h_end = c.time_start + PeriodSeconds(WORK_TF);
-         datetime zt2 = rates[total - 1].time + PeriodSeconds(WORK_TF) * 8;
+           t_h_end = c.time_start +
+                     PeriodSeconds(StructureTimeframe());
+         datetime zt2 = rates[total - 1].time +
+                       PeriodSeconds(StructureTimeframe()) * 8;
          if(zt2 < t_h_end)
             zt2 = t_h_end;
 
@@ -1966,7 +1988,8 @@ public:
                                           ? ANCHOR_LEFT_UPPER
                                           : ANCHOR_LEFT_LOWER;
             gfx.TextLabel("CM_ID_" + IntegerToString(i),
-                          c.time_start + PeriodSeconds(WORK_TF),
+                          c.time_start +
+                          PeriodSeconds(StructureTimeframe()),
                           id_price, "СПД #" + structure_id, clr,
                           InpKZFont, InpContFontSize, id_anchor);
 
@@ -2016,12 +2039,13 @@ CChartObjects     g_gfx;
 CZigZagLevel1     g_zz1;
 CCorrectionZones  g_kz;
 CContinuedMove    g_cont;
-datetime          g_last_m15_bar = 0;
+datetime          g_last_structure_bar = 0;
 MqlRates          g_rates[];
 double            g_dummy_buf[];   // служебный буфер — чтобы MT5 показал имя индикатора
 int               g_rsi_handle = INVALID_HANDLE;
 int               g_bollinger_handle = INVALID_HANDLE;
-int               g_m15_closed_count = 0;
+int               g_structure_closed_count = 0;
+datetime          g_last_bollinger_bar = 0;
 datetime          g_last_bollinger_error_bar = 0;
 bool              g_bollinger_drawn = false;
 CCanvas           g_rsi_canvas;
@@ -2038,7 +2062,7 @@ bool InitBollingerLevels(void)
       return false;
      }
 
-   g_bollinger_handle = iBands(_Symbol, WORK_TF, InpBBPeriod, 0,
+   g_bollinger_handle = iBands(_Symbol, PERIOD_M15, InpBBPeriod, 0,
                                InpBBDeviation, PRICE_CLOSE);
    if(g_bollinger_handle == INVALID_HANDLE)
      {
@@ -2064,7 +2088,9 @@ void DrawBollingerLevels(const int total)
       CopyBuffer(g_bollinger_handle, 1, 1, 1, upper) != 1 ||
       CopyBuffer(g_bollinger_handle, 2, 1, 1, lower) != 1)
      {
-      datetime error_bar = g_rates[total - 1].time;
+      datetime error_bar = (StructureTimeframe() == PERIOD_M15)
+                           ? g_rates[total - 1].time
+                           : iTime(_Symbol, PERIOD_M15, 1);
       if(g_last_bollinger_error_bar != error_bar)
         {
          Print("ActeckSmart: не удалось получить значения полос Боллинджера, err=",
@@ -2074,8 +2100,12 @@ void DrawBollingerLevels(const int total)
       return;
      }
 
-   datetime time_start = g_rates[total - 1].time;
-   datetime time_end = time_start + PeriodSeconds(WORK_TF) * InpBBLineBars;
+   datetime time_start = (StructureTimeframe() == PERIOD_M15)
+                         ? g_rates[total - 1].time
+                         : iTime(_Symbol, PERIOD_M15, 1);
+   if(time_start == 0)
+      return;
+   datetime time_end = time_start + PeriodSeconds(PERIOD_M15) * InpBBLineBars;
    bool upper_drawn = g_gfx.HLineSegment("BB_UPPER", time_start, time_end, upper[0],
                                          InpBBUpperColor, InpBBLineWidth, STYLE_SOLID);
    bool middle_drawn = g_gfx.HLineSegment("BB_MIDDLE", time_start, time_end, middle[0],
@@ -2149,7 +2179,8 @@ bool InitRSIHud(void)
    if(!InpShowRSI)
       return true;
 
-   ENUM_TIMEFRAMES tf = InpRSIUseM15 ? WORK_TF : (ENUM_TIMEFRAMES)_Period;
+   ENUM_TIMEFRAMES tf = InpRSIUseM15 ? PERIOD_M15
+                                    : (ENUM_TIMEFRAMES)_Period;
    g_rsi_handle = iRSI(_Symbol, tf, InpRSIPeriod, PRICE_CLOSE);
    if(g_rsi_handle == INVALID_HANDLE)
      {
@@ -2253,22 +2284,25 @@ void UpdateRSIHud(void)
   }
 
 //+------------------------------------------------------------------+
-//| Загрузка котировок M15                                           |
+//| Загрузка котировок структурного таймфрейма                       |
 //+------------------------------------------------------------------+
-bool LoadM15Rates(const int bars_needed)
+bool LoadStructureRates(const int bars_needed)
   {
    ArraySetAsSeries(g_rates, false); // 0 = самый старый
    ResetLastError();
-   int copied = CopyRates(_Symbol, WORK_TF, 0, bars_needed, g_rates);
+   int copied = CopyRates(_Symbol, StructureTimeframe(), 0,
+                          bars_needed, g_rates);
    if(copied <= 0)
      {
-      Print("ActeckSmart: ошибка CopyRates M15, код=", GetLastError(),
+      Print("ActeckSmart: ошибка CopyRates структурного ТФ ",
+            EnumToString(StructureTimeframe()), ", код=", GetLastError(),
             " (INVALID_HANDLE=", INVALID_HANDLE, ")");
       return false;
      }
    if(copied < 10)
      {
-      Print("ActeckSmart: недостаточно баров M15: ", copied);
+      Print("ActeckSmart: недостаточно баров структурного ТФ ",
+            EnumToString(StructureTimeframe()), ": ", copied);
       return false;
      }
    return true;
@@ -2280,13 +2314,13 @@ bool LoadM15Rates(const int bars_needed)
 void RecalculateAll(void)
   {
    int need = MathMax(InpHistoryBars, 100);
-   if(!LoadM15Rates(need))
+   if(!LoadStructureRates(need))
       return;
 
    int total = ArraySize(g_rates);
    // Не используем формирующийся бар — только закрытые
    // CopyRates включает текущий бар; исключаем последний незакрытый
-   datetime cur_bar = iTime(_Symbol, WORK_TF, 0);
+   datetime cur_bar = iTime(_Symbol, StructureTimeframe(), 0);
    if(total > 0 && g_rates[total - 1].time == cur_bar)
      {
       // Текущий бар ещё формируется — для расчёта берём total-1 закрытых
@@ -2296,7 +2330,7 @@ void RecalculateAll(void)
          return;
      }
 
-   g_m15_closed_count = total;
+   g_structure_closed_count = total;
    g_bollinger_drawn = false;
    // Синхронный wipe всех AS_* (включая старый RSI canvas)
    g_gfx.DeleteAll(true);
@@ -2423,7 +2457,7 @@ void ProcessTradeSignals(const bool alert_latest)
      }
    STradeSignal signals[];
    g_cont.BuildSignals(g_signal_rates, closed_count, signals);
-   g_cont.DrawSignalSourceZones(g_gfx, g_rates, g_m15_closed_count,
+   g_cont.DrawSignalSourceZones(g_gfx, g_rates, g_structure_closed_count,
                                 TimeCurrent(), signals);
    for(int i = 0; i < ArraySize(signals); i++)
      {
@@ -2461,16 +2495,16 @@ void ProcessTradeSignals(const bool alert_latest)
   }
 
 //+------------------------------------------------------------------+
-//| Проверка нового бара M15                                         |
+//| Проверка нового бара структурного таймфрейма                     |
 //+------------------------------------------------------------------+
-bool IsNewM15Bar(void)
+bool IsNewStructureBar(void)
   {
-   datetime t = iTime(_Symbol, WORK_TF, 0);
+   datetime t = iTime(_Symbol, StructureTimeframe(), 0);
    if(t == 0)
       return false;
-   if(t != g_last_m15_bar)
+   if(t != g_last_structure_bar)
      {
-      g_last_m15_bar = t;
+      g_last_structure_bar = t;
       return true;
      }
    return false;
@@ -2481,6 +2515,13 @@ bool IsNewM15Bar(void)
 //+------------------------------------------------------------------+
 int OnInit()
   {
+   if(PeriodSeconds(StructureTimeframe()) <= 0)
+     {
+      Print("ActeckSmart: некорректный таймфрейм структур ",
+            EnumToString(StructureTimeframe()));
+      return INIT_PARAMETERS_INCORRECT;
+     }
+
    // DRAW_NONE + SHORTNAME → системное кликабельное имя (свойства / список / удалить)
    SetIndexBuffer(0, g_dummy_buf, INDICATOR_DATA);
    SetIndexBuffer(1, g_signal_direction, INDICATOR_DATA);
@@ -2532,11 +2573,12 @@ int OnInit()
    if(!InitRSIHud())
       Print("ActeckSmart: RSI HUD отключён из-за ошибки инициализации");
 
-   g_last_m15_bar = 0;
+   g_last_structure_bar = 0;
    RecalculateAll();
    ProcessTradeSignals(false);
    UpdateRSIHud();
-   g_last_m15_bar = iTime(_Symbol, WORK_TF, 0);
+   g_last_structure_bar = iTime(_Symbol, StructureTimeframe(), 0);
+   g_last_bollinger_bar = iTime(_Symbol, PERIOD_M15, 0);
    g_last_signal_chart_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 0);
    g_allow_cont_alerts = true;
    return INIT_SUCCEEDED;
@@ -2578,31 +2620,43 @@ int OnCalculate(const int rates_total,
    // RSI HUD — на каждом тике (как у Sniper)
    UpdateRSIHud();
 
-   // Разметка КЗ/ПД — строго по закрытию свечи M15
+   // Разметка структуры — только по закрытым барам выбранного ТФ
    if(prev_calculated == 0)
      {
       RecalculateAll();
-      DrawBollingerLevels(g_m15_closed_count);
+      DrawBollingerLevels(g_structure_closed_count);
       ProcessTradeSignals(false);
-      g_last_m15_bar = iTime(_Symbol, WORK_TF, 0);
+      g_last_structure_bar = iTime(_Symbol, StructureTimeframe(), 0);
+      g_last_bollinger_bar = iTime(_Symbol, PERIOD_M15, 0);
       g_last_signal_chart_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 0);
       g_allow_cont_alerts = true;
       return rates_total;
      }
 
-   datetime current_m15_bar = iTime(_Symbol, WORK_TF, 0);
-   bool new_m15_bar = (current_m15_bar != 0 && current_m15_bar != g_last_m15_bar);
-   if(new_m15_bar)
+   datetime current_bollinger_bar = iTime(_Symbol, PERIOD_M15, 0);
+   bool new_bollinger_bar = (current_bollinger_bar != 0 &&
+                             current_bollinger_bar != g_last_bollinger_bar);
+   if(new_bollinger_bar)
      {
-      g_last_m15_bar = current_m15_bar;
+      g_last_bollinger_bar = current_bollinger_bar;
+      g_bollinger_drawn = false;
+     }
+
+   datetime current_structure_bar =
+      iTime(_Symbol, StructureTimeframe(), 0);
+   bool new_structure_bar = (current_structure_bar != 0 &&
+                             current_structure_bar != g_last_structure_bar);
+   if(new_structure_bar)
+     {
+      g_last_structure_bar = current_structure_bar;
       RecalculateAll();
      }
    if(InpShowBollingerLevels && !g_bollinger_drawn)
-      DrawBollingerLevels(g_m15_closed_count);
+      DrawBollingerLevels(g_structure_closed_count);
    datetime current_chart_bar = iTime(_Symbol, (ENUM_TIMEFRAMES)_Period, 0);
    bool new_chart_bar = (current_chart_bar != 0 &&
                          current_chart_bar != g_last_signal_chart_bar);
-   if(new_chart_bar || new_m15_bar)
+   if(new_chart_bar || new_structure_bar)
      {
       ProcessTradeSignals(new_chart_bar && g_allow_cont_alerts);
       g_last_signal_chart_bar = current_chart_bar;
