@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.40"
+#property version   "1.41"
 #property description "Советник Safe и мульти-сделки ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
@@ -935,12 +935,16 @@ void DeleteMultiPanel(void)
 
 bool CreateMultiPanel(void)
   {
+   // Chart profiles may restore objects saved before the previous shutdown.
+   DeleteMultiPanel();
+
    string background = g_multi_panel_prefix + "BG";
    color panel_fill = C'246,248,251';
    if(!ObjectCreate(0, background, OBJ_RECTANGLE_LABEL, 0, 0, 0))
      {
       Print("ActeckSmart Trader: не удалось создать фон панели MULTI, err=",
             GetLastError());
+      DeleteMultiPanel();
       return false;
      }
    ObjectSetInteger(0, background, OBJPROP_CORNER, CORNER_LEFT_UPPER);
