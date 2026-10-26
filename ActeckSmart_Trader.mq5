@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.41"
+#property version   "1.43"
 #property description "Советник Safe и мульти-сделки ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
@@ -37,18 +37,19 @@ double g_netting_leg_volume = 0.0;
 bool g_netting_tp1_done = false;
 bool g_netting_state_available = false;
 bool g_signal_lookup_warned = false;
+bool g_signal_buffer_read_warned = false;
 string g_netting_state_prefix;
 
-string g_multi_panel_prefix = "AS_MULTI_";
-string g_multi_buy_button = "AS_MULTI_BUY";
-string g_multi_sell_button = "AS_MULTI_SELL";
-string g_multi_lot_edit = "AS_MULTI_LOT";
-string g_multi_stop_edit = "AS_MULTI_STOP";
-string g_multi_lot_decrease = "AS_MULTI_LOT_MINUS";
-string g_multi_lot_increase = "AS_MULTI_LOT_PLUS";
-string g_multi_stop_decrease = "AS_MULTI_STOP_MINUS";
-string g_multi_stop_increase = "AS_MULTI_STOP_PLUS";
-string g_multi_toggle_button = "AS_MULTI_TOGGLE";
+string g_multi_panel_prefix = "ACTECK_MULTI_";
+string g_multi_buy_button = "ACTECK_MULTI_BUY";
+string g_multi_sell_button = "ACTECK_MULTI_SELL";
+string g_multi_lot_edit = "ACTECK_MULTI_LOT";
+string g_multi_stop_edit = "ACTECK_MULTI_STOP";
+string g_multi_lot_decrease = "ACTECK_MULTI_LOT_MINUS";
+string g_multi_lot_increase = "ACTECK_MULTI_LOT_PLUS";
+string g_multi_stop_decrease = "ACTECK_MULTI_STOP_MINUS";
+string g_multi_stop_increase = "ACTECK_MULTI_STOP_PLUS";
+string g_multi_toggle_button = "ACTECK_MULTI_TOGGLE";
 double g_multi_last_valid_lot = 0.01;
 double g_multi_last_valid_stop = 10.0;
 bool g_multi_panel_expanded = true;
@@ -129,9 +130,19 @@ bool ReadSignal(const datetime signal_bar, double &direction, double &entry,
       CopyBuffer(g_signal_handle, 7, 1, 1, spread_value) != 1 ||
       CopyBuffer(g_signal_handle, 8, 1, 1, spread_percent_value) != 1)
      {
-      Print("ActeckSmart Trader: не удалось прочитать буферы сигнала, err=",
-            GetLastError());
+      if(!g_signal_buffer_read_warned)
+        {
+         Print("ActeckSmart Trader: буферы сигнала пока недоступны, err=",
+               GetLastError(),
+               "; советник продолжит проверку без повторного вывода ошибки на каждом тике");
+         g_signal_buffer_read_warned = true;
+        }
       return false;
+     }
+   if(g_signal_buffer_read_warned)
+     {
+      Print("ActeckSmart Trader: чтение буферов сигнала восстановлено");
+      g_signal_buffer_read_warned = false;
      }
    if(processed_time[0] != (double)signal_bar)
       return false;
@@ -933,10 +944,29 @@ void DeleteMultiPanel(void)
    ChartRedraw(0);
   }
 
+void DeleteLegacyMultiPanel(void)
+  {
+   ObjectDelete(0, "AS_MULTI_BUY");
+   ObjectDelete(0, "AS_MULTI_SELL");
+   ObjectDelete(0, "AS_MULTI_LOT");
+   ObjectDelete(0, "AS_MULTI_STOP");
+   ObjectDelete(0, "AS_MULTI_LOT_MINUS");
+   ObjectDelete(0, "AS_MULTI_LOT_PLUS");
+   ObjectDelete(0, "AS_MULTI_STOP_MINUS");
+   ObjectDelete(0, "AS_MULTI_STOP_PLUS");
+   ObjectDelete(0, "AS_MULTI_TOGGLE");
+   ObjectDelete(0, "AS_MULTI_BG");
+   ObjectDelete(0, "AS_MULTI_HEADER");
+   ObjectDelete(0, "AS_MULTI_LOT_LABEL");
+   ObjectDelete(0, "AS_MULTI_SL_LABEL");
+   ObjectDelete(0, "AS_MULTI_ACCENT");
+  }
+
 bool CreateMultiPanel(void)
   {
-   // Chart profiles may restore objects saved before the previous shutdown.
+   // Remove prior namespaces before recreating this panel.
    DeleteMultiPanel();
+   DeleteLegacyMultiPanel();
 
    string background = g_multi_panel_prefix + "BG";
    color panel_fill = C'246,248,251';
