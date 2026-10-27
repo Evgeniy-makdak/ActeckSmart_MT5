@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.44"
+#property version   "1.45"
 #property description "Советник Safe и мульти-сделки ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
@@ -97,16 +97,16 @@ bool EnsureSignalHandle(void)
    if(g_signal_handle != INVALID_HANDLE)
       return true;
    ResetLastError();
-   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.28");
+   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.29");
    if(g_signal_handle != INVALID_HANDLE)
      {
       g_signal_lookup_warned = false;
-      Print("ActeckSmart Trader: подключён индикатор ActeckSmart v1.28");
+      Print("ActeckSmart Trader: подключён индикатор ActeckSmart v1.29");
       return true;
      }
    if(!g_signal_lookup_warned)
      {
-      Print("ActeckSmart Trader: индикатор ActeckSmart v1.28 не найден на графике; панель MULTI доступна, автосигналы ожидают индикатор, err=",
+      Print("ActeckSmart Trader: индикатор ActeckSmart v1.29 не найден на графике; панель MULTI доступна, автосигналы ожидают индикатор, err=",
             GetLastError());
       g_signal_lookup_warned = true;
      }
@@ -1176,7 +1176,7 @@ void SetMultiPanelExpanded(const bool expanded)
    ChartRedraw(0);
   }
 
-double MultiSpecificationPointPrice(void)
+double MultiInputPointPrice(void)
   {
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(point <= 0.0)
@@ -1185,6 +1185,9 @@ double MultiSpecificationPointPrice(void)
    long digits = SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    string base_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
    string profit_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
+   if(base_currency == "XAU" && profit_currency == "USD")
+      return point * 10.0;
+
    if(StringLen(base_currency) == 3 && StringLen(profit_currency) == 3)
      {
       if(profit_currency == "JPY")
@@ -1197,29 +1200,42 @@ double MultiSpecificationPointPrice(void)
    return (tick_size > 0.0) ? tick_size : point;
   }
 
+double MultiContractSpecPointPrice(void)
+  {
+   string base_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
+   string profit_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
+   if(StringLen(base_currency) == 3 && profit_currency == "JPY")
+      return 0.01;
+
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick_size > 0.0)
+      return tick_size;
+   return SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+  }
+
 double MultiContractSpecificationSpreadPrice(void)
   {
-   double specification_point = MultiSpecificationPointPrice();
-   if(specification_point <= 0.0)
+   double contract_point = MultiContractSpecPointPrice();
+   if(contract_point <= 0.0)
       return 0.0;
 
    string base_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
    string profit_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
    if(base_currency == "XAU" && profit_currency == "USD")
-      return 45.0 * specification_point;
+      return 45.0 * contract_point;
 
    if(profit_currency == "JPY")
      {
       if(base_currency == "USD")
-         return 2.0 * specification_point;
+         return 2.0 * contract_point;
       if(base_currency == "EUR")
-         return 2.2 * specification_point;
+         return 2.2 * contract_point;
       if(base_currency == "GBP")
-         return 6.1 * specification_point;
+         return 6.1 * contract_point;
       if(base_currency == "AUD")
-         return 2.4 * specification_point;
+         return 2.4 * contract_point;
       if(base_currency == "CHF")
-         return 2.5 * specification_point;
+         return 2.5 * contract_point;
      }
 
    return 0.0;
@@ -1375,18 +1391,34 @@ bool ExecuteMultiTrade(const ENUM_ORDER_TYPE order_type)
       Alert("ActeckSmart Trader: не удалось получить текущие Bid/Ask");
       return false;
      }
-   double specification_point = MultiSpecificationPointPrice();
-   if(specification_point <= 0.0)
+   double input_point = MultiInputPointPrice();
+   if(input_point <= 0.0)
      {
       Alert("ActeckSmart Trader: не удалось определить размер пункта символа");
       return false;
      }
 
    double entry = (order_type == ORDER_TYPE_BUY) ? tick.ask : tick.bid;
-   double spread = MathMax(MathMax(0.0, tick.ask - tick.bid),
-                           MultiContractSpecificationSpreadPrice());
-   double stop_distance = stop_loss_points * specification_point + spread;
+   double live_spread = MathMax(0.0, tick.ask - tick.bid);
+   double contract_spread = MultiContractSpecificationSpreadPrice();
+   double spread = MathMax(live_spread, contract_spread);
+   double base_stop_distance = stop_loss_points * input_point;
+   double stop_distance = base_stop_distance + spread;
    double common_stop = SafeLevelPrice(order_type, entry, stop_distance, true);
+   Print("ActeckSmart Trader: MULTI расчёт SL, symbol=", _Symbol,
+         ", digits=", SymbolInfoInteger(_Symbol, SYMBOL_DIGITS),
+         ", SYMBOL_POINT=", DoubleToString(
+            SymbolInfoDouble(_Symbol, SYMBOL_POINT), 8),
+         ", tick_size=", DoubleToString(
+            SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE), 8),
+         ", input_points=", DoubleToString(stop_loss_points, 2),
+         ", input_point_price=", DoubleToString(input_point, 8),
+         ", base_distance=", DoubleToString(base_stop_distance, 8),
+         ", live_spread=", DoubleToString(live_spread, 8),
+         ", spec_spread=", DoubleToString(contract_spread, 8),
+         ", effective_spread=", DoubleToString(spread, 8),
+         ", entry=", DoubleToString(entry, _Digits),
+         ", planned_SL=", DoubleToString(common_stop, _Digits));
    ulong first_ticket = 0;
    if(!OpenMultiPosition(order_type, lot, common_stop, 1.0, 1,
                          first_ticket))
@@ -1490,6 +1522,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam,
 
 int OnInit()
   {
+   Print("ActeckSmart Trader v1.45: запуск на ", _Symbol, " / ",
+         EnumToString((ENUM_TIMEFRAMES)_Period));
    if(InpRiskPercent <= 0.0 || InpRiskPercent > 2.0 ||
       InpMaximumLeverage < 1 || InpMaxSlippagePoints < 0 ||
       InpMagicNumber == 0 ||
