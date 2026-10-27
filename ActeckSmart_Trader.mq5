@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.43"
+#property version   "1.44"
 #property description "Советник Safe и мульти-сделки ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
@@ -1185,12 +1185,44 @@ double MultiSpecificationPointPrice(void)
    long digits = SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    string base_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
    string profit_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
-   if(StringLen(base_currency) == 3 && StringLen(profit_currency) == 3 &&
-      (digits == 3 || digits == 5))
-      return point * 10.0;
+   if(StringLen(base_currency) == 3 && StringLen(profit_currency) == 3)
+     {
+      if(profit_currency == "JPY")
+         return 0.01;
+      if(digits == 3 || digits == 5)
+         return point * 10.0;
+     }
 
    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    return (tick_size > 0.0) ? tick_size : point;
+  }
+
+double MultiContractSpecificationSpreadPrice(void)
+  {
+   double specification_point = MultiSpecificationPointPrice();
+   if(specification_point <= 0.0)
+      return 0.0;
+
+   string base_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
+   string profit_currency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
+   if(base_currency == "XAU" && profit_currency == "USD")
+      return 45.0 * specification_point;
+
+   if(profit_currency == "JPY")
+     {
+      if(base_currency == "USD")
+         return 2.0 * specification_point;
+      if(base_currency == "EUR")
+         return 2.2 * specification_point;
+      if(base_currency == "GBP")
+         return 6.1 * specification_point;
+      if(base_currency == "AUD")
+         return 2.4 * specification_point;
+      if(base_currency == "CHF")
+         return 2.5 * specification_point;
+     }
+
+   return 0.0;
   }
 
 bool ValidateMultiLevels(const ENUM_ORDER_TYPE order_type,
@@ -1351,7 +1383,8 @@ bool ExecuteMultiTrade(const ENUM_ORDER_TYPE order_type)
      }
 
    double entry = (order_type == ORDER_TYPE_BUY) ? tick.ask : tick.bid;
-   double spread = MathMax(0.0, tick.ask - tick.bid);
+   double spread = MathMax(MathMax(0.0, tick.ask - tick.bid),
+                           MultiContractSpecificationSpreadPrice());
    double stop_distance = stop_loss_points * specification_point + spread;
    double common_stop = SafeLevelPrice(order_type, entry, stop_distance, true);
    ulong first_ticket = 0;
@@ -1363,7 +1396,8 @@ bool ExecuteMultiTrade(const ENUM_ORDER_TYPE order_type)
      {
       Print("ActeckSmart Trader: MULTI позиция открыта, ticket=",
             first_ticket, ", volume=", DoubleToString(lot, 2),
-            ", SL=", DoubleToString(common_stop, _Digits), ", RR=1:1");
+            ", SL=", DoubleToString(common_stop, _Digits),
+            ", spread=", DoubleToString(spread, _Digits), ", RR=1:1");
       return true;
      }
 
@@ -1382,6 +1416,7 @@ bool ExecuteMultiTrade(const ENUM_ORDER_TYPE order_type)
          " открыт: count=", InpMultiOrderCount,
          ", volume/order=", DoubleToString(lot, 2),
          ", common SL=", DoubleToString(common_stop, _Digits),
+         ", spread=", DoubleToString(spread, _Digits),
          ", TP1=1:1, TP2=1:2, tickets=", first_ticket, "/", second_ticket);
    return true;
   }
