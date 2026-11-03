@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.45"
+#property version   "1.46"
 #property description "Советник Safe и мульти-сделки ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
@@ -97,16 +97,16 @@ bool EnsureSignalHandle(void)
    if(g_signal_handle != INVALID_HANDLE)
       return true;
    ResetLastError();
-   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.29");
+   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.30");
    if(g_signal_handle != INVALID_HANDLE)
      {
       g_signal_lookup_warned = false;
-      Print("ActeckSmart Trader: подключён индикатор ActeckSmart v1.29");
+      Print("ActeckSmart Trader: подключён индикатор ActeckSmart v1.30");
       return true;
      }
    if(!g_signal_lookup_warned)
      {
-      Print("ActeckSmart Trader: индикатор ActeckSmart v1.29 не найден на графике; панель MULTI доступна, автосигналы ожидают индикатор, err=",
+      Print("ActeckSmart Trader: индикатор ActeckSmart v1.30 не найден на графике; панель MULTI доступна, автосигналы ожидают индикатор, err=",
             GetLastError());
       g_signal_lookup_warned = true;
      }
@@ -1522,7 +1522,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam,
 
 int OnInit()
   {
-   Print("ActeckSmart Trader v1.45: запуск на ", _Symbol, " / ",
+   Print("ActeckSmart Trader v1.46: запуск на ", _Symbol, " / ",
          EnumToString((ENUM_TIMEFRAMES)_Period));
    if(InpRiskPercent <= 0.0 || InpRiskPercent > 2.0 ||
       InpMaximumLeverage < 1 || InpMaxSlippagePoints < 0 ||

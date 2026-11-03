@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.29"
-#property description "ActeckSmart v1.29 — настраиваемый ТФ структур"
+#property version   "1.30"
+#property description "ActeckSmart v1.30 — настраиваемый ТФ структур"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.29"
+#define AS_VERSION   "1.30"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -93,9 +93,9 @@ input color  InpBuyZoneColor         = C'173,216,230'; // Зона покупа�
 input color  InpSellZoneColor        = C'255,182,193'; // Зона продавцов (нежно-розовый)
 input int    InpZoneAlpha            = 70;        // Непрозрачность НЕДОСТИГНУТОЙ зоны (0-255)
 input int    InpZoneTouchedAlpha     = 45;        // Непрозрачность ЗАТРОНУТОЙ (не пробитой) зоны
-input bool   InpZoneHideBroken       = true;      // Не рисовать зоны, пробитые ценой (ликвидность снята)
+input bool   InpZoneHideBroken       = true;      // Пробитые зоны: контур без заливки (false = заливка)
 input bool   InpZoneShowStateLabel   = true;      // Показывать метку состояния зоны
-input int    InpFreshZoneKeepDays    = 7;         // Сколько дней показывать нетронутую зону
+input int    InpFreshZoneKeepDays    = 7;         // Дни показа нетронутых зон и контуров после пробоя
 input double InpFibLevel             = 0.382;     // Fib базовой модели; каскадная модель — 23.6%
 
 input string InpSepBB                = "======== ПОЛОСЫ БОЛЛИНДЖЕРА (M15) ========"; // —
@@ -571,8 +571,8 @@ bool ShouldDeleteByAge(const datetime object_day, const datetime now_broker)
    return (days >= InpFadeDays2 + 1);
   }
 
-bool IsFreshZoneWithinRetention(const datetime zone_time,
-                                const datetime now_broker)
+bool IsZoneWithinRetention(const datetime zone_time,
+                           const datetime now_broker)
   {
    if(InpKeepHistory)
       return true;
@@ -702,6 +702,28 @@ public:
       ObjectSetInteger(m_chart, full, OBJPROP_STYLE, STYLE_DOT);
       ObjectSetInteger(m_chart, full, OBJPROP_WIDTH, 1);
       ObjectSetInteger(m_chart, full, OBJPROP_FILL, true);
+      ObjectSetInteger(m_chart, full, OBJPROP_BACK, true);
+      ObjectSetInteger(m_chart, full, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(m_chart, full, OBJPROP_TIME, 0, t1);
+      ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 0, p1);
+      ObjectSetInteger(m_chart, full, OBJPROP_TIME, 1, t2);
+      ObjectSetDouble(m_chart, full, OBJPROP_PRICE, 1, p2);
+      return true;
+     }
+
+   bool RectangleOutline(const string name, datetime t1, double p1,
+                         datetime t2, double p2, const color clr)
+     {
+      string full = m_prefix + name;
+      if(ObjectFind(m_chart, full) < 0)
+        {
+         if(!ObjectCreate(m_chart, full, OBJ_RECTANGLE, 0, t1, p1, t2, p2))
+            return false;
+        }
+      ObjectSetInteger(m_chart, full, OBJPROP_COLOR, clr);
+      ObjectSetInteger(m_chart, full, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(m_chart, full, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(m_chart, full, OBJPROP_FILL, false);
       ObjectSetInteger(m_chart, full, OBJPROP_BACK, true);
       ObjectSetInteger(m_chart, full, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(m_chart, full, OBJPROP_TIME, 0, t1);
@@ -1796,8 +1818,7 @@ public:
    bool IsSignalDisplayable(const STradeSignal &signal,
                             const datetime now_broker) const
      {
-      if(!InpShowInterestZones ||
-         !IsSignalWithinZoneRetention(signal.structure_index, now_broker))
+      if(!IsSignalWithinZoneRetention(signal.structure_index, now_broker))
          return false;
       double zone_low, zone_high;
       SContinued item = m_items[signal.structure_index];
@@ -1861,8 +1882,10 @@ public:
          st = ZONE_BROKEN;
         }
 
-      // Пробитые — не рисуем (ликвидность собрана, ориентир потерян)
-      if(st == ZONE_BROKEN && InpZoneHideBroken && !signal_source)
+      bool broken_outline = (st == ZONE_BROKEN && InpZoneHideBroken);
+      if(broken_outline && !signal_source &&
+         (broken_time == 0 ||
+          !IsZoneWithinRetention(broken_time, now_broker)))
          return;
 
       color zclr = (c.direction == DIR_UP) ? InpBuyZoneColor : InpSellZoneColor;
@@ -1880,9 +1903,13 @@ public:
          return;
 
       string zname = "CM_Z_" + IntegerToString(idx);
-      gfx.Rectangle(zname, c.time_start, z_lo, zone_end, z_hi, zclr, za);
+      if(broken_outline)
+         gfx.RectangleOutline(zname, c.time_start, z_lo, zone_end, z_hi,
+                              zclr);
+      else
+         gfx.Rectangle(zname, c.time_start, z_lo, zone_end, z_hi, zclr, za);
 
-      if(InpZoneShowStateLabel)
+      if(InpZoneShowStateLabel && !broken_outline)
         {
          string structure_id = StringFormat("%03d", idx + 1);
          string state = (signal_source) ? "ВЫНОС ЛИКВИДНОСТИ | ИМПУЛЬС"
@@ -1949,16 +1976,24 @@ public:
                           (sniper_hist ? (InpKeepObsoleteZones || !c.obsolete)
                                        : !c.obsolete);
          bool keep_fresh_zone = false;
-         if(expired_by_age && show_zone &&
-            IsFreshZoneWithinRetention(c.time_start, now_broker))
+         bool keep_broken_zone_outline = false;
+         if(expired_by_age && show_zone)
            {
             double zone_low, zone_high;
-            datetime ignored_broken_time;
-            keep_fresh_zone = (AssessZone(i, c, rates, total, zone_low,
-                                          zone_high, ignored_broken_time) ==
-                               ZONE_FRESH);
+            datetime zone_broken_time;
+            ENUM_ZONE_STATE zone_state = AssessZone(i, c, rates, total,
+                                                    zone_low, zone_high,
+                                                    zone_broken_time);
+            keep_fresh_zone = (zone_state == ZONE_FRESH &&
+                               IsZoneWithinRetention(c.time_start,
+                                                     now_broker));
+            keep_broken_zone_outline =
+               (zone_state == ZONE_BROKEN && InpZoneHideBroken &&
+                zone_broken_time != 0 &&
+                IsZoneWithinRetention(zone_broken_time, now_broker));
            }
-         if(expired_by_age && !keep_fresh_zone)
+         if(expired_by_age && !keep_fresh_zone &&
+            !keep_broken_zone_outline)
             continue;
 
          // Sniper сохраняет исторические пунктиры. В режиме v1.1 ими управляют
@@ -1966,7 +2001,9 @@ public:
          const bool hide_lines = expired_by_age || (!sniper_hist &&
                                  ((InpHideObsoleteCM && c.obsolete) || (i < first_lines)));
          // Зона показывается для исторических СПД согласно настройке.
-         show_zone = show_zone && (!expired_by_age || keep_fresh_zone);
+         show_zone = show_zone &&
+                     (!expired_by_age || keep_fresh_zone ||
+                      keep_broken_zone_outline);
          color base = (c.direction == DIR_UP) ? InpContUpColor : InpContDownColor;
          color clr  = ApplyFade(base, c.time_start, now_broker);
 
@@ -2564,7 +2601,7 @@ int OnInit()
      }
    if(InpFreshZoneKeepDays < 1 || InpRSIPanelYOffset < 0)
      {
-      Print("ActeckSmart: срок хранения нетронутых зон должен быть не меньше одного дня, а отступ RSI не может быть отрицательным");
+      Print("ActeckSmart: срок хранения зон должен быть не меньше одного дня, а отступ RSI не может быть отрицательным");
       return INIT_PARAMETERS_INCORRECT;
      }
 
