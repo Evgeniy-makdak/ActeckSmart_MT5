@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.30"
-#property description "ActeckSmart v1.30 — настраиваемый ТФ структур"
+#property version   "1.31"
+#property description "ActeckSmart v1.31 — настраиваемый ТФ структур"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.30"
+#define AS_VERSION   "1.31"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -1454,32 +1454,71 @@ public:
      }
 
    void BuildSignals(const MqlRates &chart_rates[], const int total,
-                     STradeSignal &signals[]) const
+                     STradeSignal &signals[],
+                     string &diagnostics) const
      {
       ArrayResize(signals, 0);
-      if(m_kz == NULL || total <= 0)
+      diagnostics = "";
+      if(m_kz == NULL)
+        {
+         diagnostics = "kz_module_unavailable=1";
          return;
+        }
+      if(total <= 0)
+        {
+         diagnostics = "no_closed_bars=1";
+         return;
+        }
+      int structures_total = ArraySize(m_items);
+      int structures_open = 0;
+      int structures_without_model = 0;
+      int structures_disabled = 0;
+      int zones_invalid = 0;
+      int no_retest = 0;
+      int no_sweep = 0;
+      int no_impulse = 0;
+      int setups_invalidated = 0;
+      int no_target = 0;
+      int target_too_close = 0;
+      int missing_specification = 0;
       for(int i = 0; i < ArraySize(m_items); i++)
         {
          SContinued item = m_items[i];
          if(!item.closed || item.time_end == 0)
+           {
+            structures_open++;
             continue;
+           }
 
          ENUM_SIGNAL_MODEL model;
          if(!GetSignalModel(i, model))
+           {
+            structures_without_model++;
             continue;
+           }
 
          if((model == SIGNAL_MODEL_BASE && !InpEnableBaseSignals) ||
             (model == SIGNAL_MODEL_CASCADE && !InpEnableCascadeSignals))
+           {
+            structures_disabled++;
             continue;
+           }
 
          double zone_low, zone_high;
          if(!GetInterestZoneBounds(item, FibLevelForModel(model),
                                    zone_low, zone_high))
+           {
+            zones_invalid++;
             continue;
+           }
 
          bool zone_revisited = false;
          bool liquidity_swept = false;
+         bool signal_created = false;
+         bool setup_invalidated = false;
+         bool rejected_without_target = false;
+         bool rejected_target_too_close = false;
+         bool rejected_without_specification = false;
          datetime liquidity_sweep_time = 0;
          for(int bar = 0; bar < total; bar++)
            {
@@ -1509,7 +1548,10 @@ public:
                bool first_retest = (intersects_zone &&
                                     approached_from_expected_side);
                if(swept_this_bar && !first_retest)
+                 {
+                  setup_invalidated = true;
                   break;
+                 }
                if(!first_retest)
                   continue;
                zone_revisited = true;
@@ -1539,7 +1581,10 @@ public:
                   (item.direction == DIR_UP &&
                    chart_rates[bar].close < zone_low);
                if(continuation_confirmed)
+                 {
+                  setup_invalidated = true;
                   break;
+                 }
                continue;
               }
 
@@ -1549,7 +1594,10 @@ public:
             if(!GetContractSpecSpreadPrice(_Symbol, entry, spread_price,
                                            spread_percent,
                                            distance_point_price))
+              {
+               rejected_without_specification = true;
                break;
+              }
 
             double stop_distance = InpSignalStopPoints *
                                    distance_point_price + spread_price;
@@ -1564,7 +1612,10 @@ public:
             double target = 0.0;
             if(!m_kz.GetNearestTarget(item.direction, chart_rates[bar].time,
                                       entry, target))
+              {
+               rejected_without_target = true;
                break;
+              }
 
             double stop = (item.direction == DIR_UP)
                           ? entry - stop_distance : entry + stop_distance;
@@ -1574,7 +1625,10 @@ public:
                          ? entry + tp2_distance : entry - tp2_distance;
             if((item.direction == DIR_UP && target < tp2) ||
                (item.direction == DIR_DOWN && target > tp2))
+              {
+               rejected_target_too_close = true;
                break;
+              }
 
             STradeSignal signal;
             signal.time = chart_rates[bar].time;
@@ -1595,8 +1649,25 @@ public:
             int n = ArraySize(signals);
             ArrayResize(signals, n + 1);
             signals[n] = signal;
+            signal_created = true;
             break;
            }
+         if(signal_created)
+            continue;
+         if(setup_invalidated)
+            setups_invalidated++;
+         else if(rejected_without_specification)
+            missing_specification++;
+         else if(rejected_without_target)
+            no_target++;
+         else if(rejected_target_too_close)
+            target_too_close++;
+         else if(!zone_revisited)
+            no_retest++;
+         else if(!liquidity_swept)
+            no_sweep++;
+         else
+            no_impulse++;
         }
 
       for(int i = 0; i < ArraySize(signals) - 1; i++)
@@ -1626,6 +1697,16 @@ public:
          i = next;
         }
       ArrayResize(signals, write);
+      diagnostics = StringFormat(
+         "structures=%d, open_or_unconfirmed=%d, no_base_or_cascade_model=%d, " +
+         "model_disabled=%d, invalid_zone=%d, no_expected_side_retest=%d, " +
+         "no_far_edge_sweep=%d, no_confirming_impulse=%d, " +
+         "setup_invalidated=%d, no_target_kz=%d, target_inside_TP2=%d, " +
+         "no_contract_spec=%d, generated=%d",
+         structures_total, structures_open, structures_without_model,
+         structures_disabled, zones_invalid, no_retest, no_sweep, no_impulse,
+         setups_invalidated, no_target, target_too_close,
+         missing_specification, ArraySize(signals));
      }
 
    void Build(const MqlRates &rates[], const int total)
@@ -2084,6 +2165,7 @@ CZigZagLevel1     g_zz1;
 CCorrectionZones  g_kz;
 CContinuedMove    g_cont;
 datetime          g_last_structure_bar = 0;
+datetime          g_last_signal_diagnostic_bar = 0;
 MqlRates          g_rates[];
 double            g_dummy_buf[];   // служебный буфер — чтобы MT5 показал имя индикатора
 int               g_rsi_handle = INVALID_HANDLE;
@@ -2499,28 +2581,39 @@ void ProcessTradeSignals(const bool alert_latest)
       if(shift < ArraySize(g_signal_processed_time))
          g_signal_processed_time[shift] = (double)g_signal_rates[i].time;
      }
-   STradeSignal signals[];
-   g_cont.BuildSignals(g_signal_rates, closed_count, signals);
-   g_cont.DrawSignalSourceZones(g_gfx, g_rates, g_structure_closed_count,
-                                TimeCurrent(), signals);
-   for(int i = 0; i < ArraySize(signals); i++)
-     {
-      STradeSignal signal = signals[i];
-      if(!g_cont.IsSignalDisplayable(signal, TimeCurrent()))
-         continue;
+     STradeSignal signals[];
+     string signal_diagnostics;
+     g_cont.BuildSignals(g_signal_rates, closed_count, signals,
+                      signal_diagnostics);
+     g_cont.DrawSignalSourceZones(g_gfx, g_rates, g_structure_closed_count,
+                               TimeCurrent(), signals);
+     int not_displayable = 0;
+     int no_chart_bar = 0;
+     int displayed_signals = 0;
+     for(int i = 0; i < ArraySize(signals); i++)
+       {
+        STradeSignal signal = signals[i];
+        if(!g_cont.IsSignalDisplayable(signal, TimeCurrent()))
+       {
+        not_displayable++;
+        continue;
+       }
 
-      int shift = iBarShift(_Symbol, (ENUM_TIMEFRAMES)_Period, signal.time, true);
-      if(shift < 1 || shift >= ArraySize(g_signal_direction))
-         continue;
-
-      g_signal_direction[shift] = (signal.direction == DIR_UP) ? 1.0 : -1.0;
-      g_signal_stop[shift] = signal.stop_loss;
-      g_signal_tp1[shift] = signal.take_profit_1;
+        int shift = iBarShift(_Symbol, (ENUM_TIMEFRAMES)_Period, signal.time, true);
+        if(shift < 1 || shift >= ArraySize(g_signal_direction))
+       {
+        no_chart_bar++;
+        continue;
+       }
+        g_signal_direction[shift] = (signal.direction == DIR_UP) ? 1.0 : -1.0;
+        g_signal_stop[shift] = signal.stop_loss;
+        g_signal_tp1[shift] = signal.take_profit_1;
       g_signal_tp2[shift] = signal.take_profit_2;
       g_signal_model[shift] = (double)signal.model;
       g_signal_spread_price[shift] = signal.spread_price;
       g_signal_spread_percent[shift] = signal.spread_percent;
       DrawTradeSignal(signal);
+      displayed_signals++;
 
       if(alert_latest && InpSignalAlerts && signal.time == latest_closed_time &&
          signal.time != g_last_trade_signal_time)
@@ -2534,6 +2627,19 @@ void ProcessTradeSignals(const bool alert_latest)
                " / TP2 ", DoubleToString(signal.take_profit_2, _Digits));
          g_last_trade_signal_time = signal.time;
         }
+     }
+   datetime diagnostic_bar = iTime(_Symbol, StructureTimeframe(), 0);
+   if(displayed_signals == 0 && diagnostic_bar != 0 &&
+      diagnostic_bar != g_last_signal_diagnostic_bar)
+     {
+      g_last_signal_diagnostic_bar = diagnostic_bar;
+      Print("ActeckSmart: сигнальных стрелок нет, symbol=", _Symbol,
+            ", chart_tf=", EnumToString((ENUM_TIMEFRAMES)_Period),
+            ", structure_tf=", EnumToString(StructureTimeframe()),
+            ", inspected_bars=", closed_count,
+            ", ", signal_diagnostics,
+            ", rejected_by_display_filter=", not_displayable,
+            ", no_exact_chart_bar=", no_chart_bar);
      }
    ChartRedraw(ChartID());
   }

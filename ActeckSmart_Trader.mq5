@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.46"
+#property version   "1.47"
 #property description "Советник Safe и мульти-сделки ActeckSmart; автоторговля выключена по умолчанию"
 
 #include <Trade/Trade.mqh>
@@ -97,16 +97,16 @@ bool EnsureSignalHandle(void)
    if(g_signal_handle != INVALID_HANDLE)
       return true;
    ResetLastError();
-   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.30");
+   g_signal_handle = ChartIndicatorGet(ChartID(), 0, "ActeckSmart v1.31");
    if(g_signal_handle != INVALID_HANDLE)
      {
       g_signal_lookup_warned = false;
-      Print("ActeckSmart Trader: подключён индикатор ActeckSmart v1.30");
+      Print("ActeckSmart Trader: подключён индикатор ActeckSmart v1.31");
       return true;
      }
    if(!g_signal_lookup_warned)
      {
-      Print("ActeckSmart Trader: индикатор ActeckSmart v1.30 не найден на графике; панель MULTI доступна, автосигналы ожидают индикатор, err=",
+      Print("ActeckSmart Trader: индикатор ActeckSmart v1.31 не найден на графике; панель MULTI доступна, автосигналы ожидают индикатор, err=",
             GetLastError());
       g_signal_lookup_warned = true;
      }
@@ -1290,18 +1290,8 @@ bool OpenMultiPosition(const ENUM_ORDER_TYPE order_type, const double volume,
 
    if(g_trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL)
      {
-      double partial_fill = 0.0;
-      ulong partial_ticket = 0;
-      if(GetFillPriceAndPosition(g_trade.ResultDeal(), partial_fill,
-                                 partial_ticket))
-        {
-         if(!CloseHedgingPositionFully(partial_ticket))
-            Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть частично исполненную MULTI-позицию, ticket ",
-                  partial_ticket);
-        }
-      else
-         Alert("ActeckSmart Trader: КРИТИЧНО — частичное исполнение MULTI; проверьте позицию вручную");
-      return false;
+      Print("ActeckSmart Trader: MULTI-позиция ", position_number,
+            " исполнена частично; сохраняю открытую позицию и её SL/TP");
      }
 
    double fill_price = 0.0;
@@ -1317,11 +1307,16 @@ bool OpenMultiPosition(const ENUM_ORDER_TYPE order_type, const double volume,
                                     actual_risk * reward_ratio, false);
    if(!ValidateMultiLevels(order_type, common_stop, final_tp))
      {
-      Print("ActeckSmart Trader: после исполнения цены не соответствуют ограничениям SL/TP");
-      if(!CloseHedgingPositionFully(position_ticket))
-         Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть MULTI-позицию с недопустимым TP, ticket ",
-               position_ticket);
-      return false;
+      if(PositionSelectByTicket(position_ticket))
+         Print("ActeckSmart Trader: фактический TP для MULTI-позиции ",
+               position_number,
+               " не прошёл проверку минимальной дистанции; сохраняю позицию с исходными SL=",
+               DoubleToString(PositionGetDouble(POSITION_SL), _Digits),
+               " и TP=", DoubleToString(PositionGetDouble(POSITION_TP), _Digits),
+               ", ticket=", position_ticket);
+      else
+         Alert("ActeckSmart Trader: MULTI-позиция исполнена, но её ticket уже недоступен; проверьте SL/TP вручную");
+      return true;
      }
    bool modification_sent =
       g_trade.PositionModify(position_ticket, common_stop, final_tp);
@@ -1331,12 +1326,17 @@ bool OpenMultiPosition(const ENUM_ORDER_TYPE order_type, const double volume,
       modification_retcode == TRADE_RETCODE_NO_CHANGES;
    if(!modification_succeeded)
      {
-      Print("ActeckSmart Trader: не удалось установить TP по фактическому fill: ",
-            g_trade.ResultRetcodeDescription());
-      if(!CloseHedgingPositionFully(position_ticket))
-         Alert("ActeckSmart Trader: КРИТИЧНО — не удалось закрыть MULTI-позицию после ошибки установки TP, ticket ",
-               position_ticket);
-      return false;
+      if(PositionSelectByTicket(position_ticket))
+         Print("ActeckSmart Trader: не удалось пересчитать TP MULTI-позиции ",
+               position_number, " по фактическому fill: ",
+               g_trade.ResultRetcodeDescription(),
+               "; сохраняю установленные при открытии SL=",
+               DoubleToString(PositionGetDouble(POSITION_SL), _Digits),
+               " и TP=", DoubleToString(PositionGetDouble(POSITION_TP), _Digits),
+               ", ticket=", position_ticket);
+      else
+         Alert("ActeckSmart Trader: MULTI-позиция исполнена, но её ticket уже недоступен после ошибки установки TP; проверьте позицию вручную");
+      return true;
      }
    return true;
   }
@@ -1437,9 +1437,10 @@ bool ExecuteMultiTrade(const ENUM_ORDER_TYPE order_type)
    if(!OpenMultiPosition(order_type, lot, common_stop, 2.0, 2,
                          second_ticket))
      {
-      if(!CloseHedgingPositionFully(first_ticket))
-         Alert("ActeckSmart Trader: КРИТИЧНО — второй MULTI-ордер не открыт, первый не удалось закрыть. Ticket ",
-               first_ticket);
+      string side = (order_type == ORDER_TYPE_BUY) ? "BUY" : "SELL";
+      Alert("ActeckSmart Trader: второй MULTI-ордер не открыт; первая ",
+            side, "-позиция оставлена с исходными SL/TP. Ticket ",
+            first_ticket, ". Проверьте журнал и историю");
       return false;
      }
 
@@ -1522,7 +1523,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam,
 
 int OnInit()
   {
-   Print("ActeckSmart Trader v1.46: запуск на ", _Symbol, " / ",
+   Print("ActeckSmart Trader v1.47: запуск на ", _Symbol, " / ",
          EnumToString((ENUM_TIMEFRAMES)_Period));
    if(InpRiskPercent <= 0.0 || InpRiskPercent > 2.0 ||
       InpMaximumLeverage < 1 || InpMaxSlippagePoints < 0 ||
