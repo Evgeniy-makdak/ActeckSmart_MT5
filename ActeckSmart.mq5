@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Евгений Ацтек"
 #property link      "https://github.com/Evgeniy-makdak/ActeckSmart_MT5"
-#property version   "1.31"
-#property description "ActeckSmart v1.31 — настраиваемый ТФ структур"
+#property version   "1.32"
+#property description "ActeckSmart v1.32 — настраиваемый ТФ структур"
 #property indicator_chart_window
 #property indicator_buffers 9
 #property indicator_plots   1
@@ -14,7 +14,7 @@
 #property indicator_label1  "ActeckSmart"
 
 // Версия индикатора
-#define AS_VERSION   "1.31"
+#define AS_VERSION   "1.32"
 #define AS_SHORTNAME "ActeckSmart v" AS_VERSION
 #define AS_RSI_CANVAS "RSI_CV" // единая панель RSI (spark + число)
 
@@ -2058,14 +2058,15 @@ public:
                                        : !c.obsolete);
          bool keep_fresh_zone = false;
          bool keep_broken_zone_outline = false;
-         if(expired_by_age && show_zone)
+         if(InpShowInterestZones)
            {
             double zone_low, zone_high;
             datetime zone_broken_time;
             ENUM_ZONE_STATE zone_state = AssessZone(i, c, rates, total,
                                                     zone_low, zone_high,
                                                     zone_broken_time);
-            keep_fresh_zone = (zone_state == ZONE_FRESH &&
+            keep_fresh_zone = (show_zone &&
+                               zone_state == ZONE_FRESH &&
                                IsZoneWithinRetention(c.time_start,
                                                      now_broker));
             keep_broken_zone_outline =
@@ -2082,7 +2083,7 @@ public:
          const bool hide_lines = expired_by_age || (!sniper_hist &&
                                  ((InpHideObsoleteCM && c.obsolete) || (i < first_lines)));
          // Зона показывается для исторических СПД согласно настройке.
-         show_zone = show_zone &&
+         show_zone = (show_zone || keep_broken_zone_outline) &&
                      (!expired_by_age || keep_fresh_zone ||
                       keep_broken_zone_outline);
          color base = (c.direction == DIR_UP) ? InpContUpColor : InpContDownColor;
